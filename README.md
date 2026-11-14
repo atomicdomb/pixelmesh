@@ -102,16 +102,33 @@ faces keep their texture exactly in place through all three.
 
 ## UV editor
 
-Select an object (all its faces) or individual faces in face mode, then:
+The UV editor shows the faces chosen in the 3D view: the whole selected
+object in object mode, or the selected faces in face mode. Inside it you
+have a separate UV selection.
 
-- drag a corner to move it (corners sharing the spot move together),
-- drag inside a face to move all selected faces as one island,
-- scroll to zoom, right- or middle-drag to pan.
+| Input | Action |
+|-------|--------|
+| V / F (or the buttons) | Select UV vertices / whole faces |
+| Q / B / C (or the buttons) | Click / box / circle select; Shift adds, Ctrl removes |
+| A / Alt+A | Select all / none |
+| Drag a selected vertex or face | Move the selection |
+| Drag a handle on the selection box | Scale; the opposite side stays put. Shift keeps proportions |
+| G | Move with the mouse; X / Y lock an axis; click confirms, Esc cancels |
+| S | Scale about the centre; X / Y lock an axis |
+| Scroll, right- or middle-drag | Zoom, pan |
 
-With "Snap UVs to pixels" on, everything lands on texel boundaries.
-"Box project" unwraps at a fixed texel density ("Pixels per unit"), so a
-1-unit face covers exactly e.g. 16x16 pixels. The texture reloads
-automatically when the PNG changes on disk.
+UV vertices that share a position are picked together, so stitched faces
+stay stitched. In click mode, dragging something unselected selects and
+moves it in one go.
+
+**Snap to pixels** (on by default): moves land on pixel corners, handles
+snap to the pixel grid, and S snaps the selection's size to whole pixels.
+The readout at the bottom shows the move or size in pixels. "Snap
+selection now" rounds the selected UVs to the nearest pixel corners.
+
+"Box project" (right panel) unwraps at a fixed texel density ("Pixels per
+unit"), so a 1-unit face covers exactly e.g. 16x16 pixels. The texture
+reloads automatically when the image changes on disk.
 
 ## FBX import
 

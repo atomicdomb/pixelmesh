@@ -329,6 +329,7 @@ impl App {
     pub fn clear_selection(&mut self) {
         self.sel_verts.clear();
         self.sel_faces.clear();
+        self.uv.sel.clear();
     }
 
     /// Deselect everything in the current mode.
@@ -364,6 +365,8 @@ impl App {
         self.objects = s.objects;
         self.active = s.active;
         self.sel_objects = s.sel_objects;
+        // UV selections refer to corners of the mesh as it was; do not carry them across an undo.
+        self.uv.sel.clear();
         self.sel_verts = s.sel_verts;
         self.sel_faces = s.sel_faces;
     }
@@ -1020,7 +1023,6 @@ impl App {
                 ui.label("Pixels per unit");
                 ui.add(egui::DragValue::new(&mut self.px_per_unit).speed(0.25).range(1.0..=512.0));
             });
-            ui.checkbox(&mut self.uv.snap, "Snap UVs to pixels");
             ui.checkbox(&mut self.uv.show_all, "Show unselected faces");
 
             ui.separator();

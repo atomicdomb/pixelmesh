@@ -735,7 +735,8 @@ impl App {
         let mut preview = Preview::default();
         // Snapping is on when the toggle is set; holding Ctrl flips it for the moment.
         let snap = self.snap_on != mods.command;
-        let keyboard_free = !ui.ctx().egui_wants_keyboard_input();
+        // While the UV editor is running a keyboard move / scale, keys belong to it.
+        let keyboard_free = !ui.ctx().egui_wants_keyboard_input() && !self.uv.is_modal();
         let gizmo_before = if self.show_gizmo && !self.busy() { self.gizmo(rect) } else { None };
         let over_gizmo = |p: Option<Pos2>| gizmo_before.as_ref().zip(p).and_then(|(g, p)| g.hit(p));
 
