@@ -87,6 +87,10 @@ pub struct App {
     /// Box / circle select skip vertices and faces hidden behind geometry.
     pub only_visible: bool,
     pub region: Option<crate::viewport::Region>,
+    /// Inset / bevel being sized with the mouse.
+    pub op: Option<crate::viewport::OpModal>,
+    /// Loop cut being placed.
+    pub loop_cut: Option<crate::viewport::LoopCut>,
     empty: Mesh,
     pub sel_mode: SelMode,
     last_edit_mode: SelMode,
@@ -134,6 +138,8 @@ impl App {
             circle_radius: 40.0,
             only_visible: true,
             region: None,
+            op: None,
+            loop_cut: None,
             empty: Mesh::default(),
             sel_mode: SelMode::Object,
             last_edit_mode: SelMode::Face,
@@ -171,6 +177,11 @@ impl App {
     }
 
     // --------------------------------------------------------------- objects
+
+    /// True while a tool that follows the mouse is running; menus and panels are locked meanwhile.
+    pub fn busy(&self) -> bool {
+        self.modal.is_some() || self.op.is_some() || self.loop_cut.is_some()
+    }
 
     /// Mesh of the active object (an empty mesh when the scene has no objects).
     pub fn mesh(&self) -> &Mesh {
@@ -877,6 +888,15 @@ impl App {
                 if ui.button("Extrude (E)").clicked() {
                     self.extrude();
                 }
+                if ui.button("Inset (I)").on_hover_text("Shrink the selected faces inwards, leaving a rim").clicked() {
+                    self.start_inset();
+                }
+                if ui.button("Bevel (Ctrl+B)").on_hover_text("Chamfer the edges of the selected faces (or between selected vertices)").clicked() {
+                    self.start_bevel();
+                }
+                if ui.button("Loop cut (Ctrl+R)").on_hover_text("Cut a ring of faces in two; hover an edge to choose where").clicked() {
+                    self.start_loop_cut();
+                }
                 if ui.button("Duplicate (Shift+D)").clicked() && self.duplicate_selection() {
                     self.start_modal(crate::viewport::ModalKind::Grab, None);
                 }
@@ -1007,8 +1027,55 @@ impl App {
         self.start_modal_no_undo(crate::viewport::ModalKind::Grab, Some(normal));
     }
 
+    pub fn start_inset(&mut self) {
+        if self.sel_mode == SelMode::Object {
+            self.status = "Inset works on faces: press Tab or F, select faces, then I.".into();
+            return;
+        }
+        let faces = self.active_faces();
+        if faces.is_empty() {
+            self.status = "Inset needs at least one whole face selected.".into();
+            return;
+        }
+        self.push_undo();
+        self.op = Some(crate::viewport::OpModal::new(crate::viewport::OpKind::Inset, self.mesh().clone(), faces, BTreeSet::new()));
+    }
+
+    pub fn start_bevel(&mut self) {
+        let mesh = self.mesh();
+        let edges: BTreeSet<(u32, u32)> = match self.sel_mode {
+            SelMode::Object => {
+                self.status = "Bevel works on edges: press Tab, select faces or vertices, then Ctrl+B.".into();
+                return;
+            }
+            // Face mode: every edge of the selected faces.
+            SelMode::Face => self.sel_faces.iter().flat_map(|&f| {
+                let v = &mesh.faces[f].verts;
+                (0..v.len()).map(|i| (v[i].min(v[(i + 1) % v.len()]), v[i].max(v[(i + 1) % v.len()]))).collect::<Vec<_>>()
+            }).collect(),
+            // Vertex mode: every edge with both ends selected.
+            SelMode::Vertex => mesh.edges().into_iter()
+                .filter(|(a, b)| self.sel_verts.contains(a) && self.sel_verts.contains(b))
+                .collect(),
+        };
+        if edges.is_empty() {
+            self.status = "Bevel needs edges: select faces, or the vertices at both ends of an edge.".into();
+            return;
+        }
+        self.push_undo();
+        self.op = Some(crate::viewport::OpModal::new(crate::viewport::OpKind::Bevel, self.mesh().clone(), BTreeSet::new(), edges));
+    }
+
+    pub fn start_loop_cut(&mut self) {
+        if self.mesh().faces.is_empty() {
+            self.status = "Loop cut needs an object with faces.".into();
+            return;
+        }
+        self.loop_cut = Some(crate::viewport::LoopCut::new());
+    }
+
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() || self.modal.is_some() {
+        if ctx.egui_wants_keyboard_input() || self.busy() {
             return;
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::J)) {
@@ -1034,7 +1101,7 @@ impl eframe::App for App {
         self.shortcuts(&ctx);
 
         // Menus and tools are locked while a move / rotate / scale is in progress.
-        let idle = self.modal.is_none();
+        let idle = !self.busy();
         egui::Panel::top("menu").show(ui, |ui| ui.add_enabled_ui(idle, |ui| self.menu_bar(ui)));
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1043,7 +1110,7 @@ impl eframe::App for App {
         });
         egui::Panel::right("tools").resizable(false).exact_size(250.0).show(ui, |ui| ui.add_enabled_ui(idle, |ui| self.tool_panel(ui)));
         if self.show_uv {
-            egui::Panel::left("uv").resizable(true).default_size(440.0).min_size(200.0).show(ui, |ui| self.uv_editor(ui));
+            egui::Panel::left("uv").resizable(true).default_size(440.0).min_size(200.0).show(ui, |ui| ui.add_enabled_ui(idle, |ui| self.uv_editor(ui)));
         }
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.viewport(ui));
     }
@@ -1054,7 +1121,7 @@ impl eframe::App for App {
         let is_tab = |e: &egui::Event| matches!(e, egui::Event::Key { key: Key::Tab, .. });
         let pressed = raw.events.iter().any(|e| matches!(e, egui::Event::Key { key: Key::Tab, pressed: true, repeat: false, .. }));
         raw.events.retain(|e| !is_tab(e));
-        if pressed && self.modal.is_none() && !ctx.egui_wants_keyboard_input() {
+        if pressed && !self.busy() && !ctx.egui_wants_keyboard_input() {
             self.toggle_edit_mode();
         }
     }

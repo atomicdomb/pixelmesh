@@ -6,6 +6,7 @@ use crate::render::{Batch, FrameData};
 use eframe::egui::{self, Color32, Key, PointerButton, Pos2, Sense, Stroke};
 use eframe::egui_glow;
 use glam::{Quat, Vec3};
+use pixelmesh::mesh::{EdgeRing, Mesh};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -32,6 +33,50 @@ pub struct Modal {
     readout: String,
     /// True for gizmo drags: confirm on mouse release.
     drag: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OpKind {
+    Inset,
+    Bevel,
+}
+
+/// An inset or bevel being sized: every frame the operation is re-applied to
+/// `base` (the mesh as it was) with the amount taken from the mouse.
+pub struct OpModal {
+    kind: OpKind,
+    base: Mesh,
+    faces: BTreeSet<usize>,
+    edges: BTreeSet<(u32, u32)>,
+    start_mouse: Option<Pos2>,
+    value: f32,
+}
+
+impl OpModal {
+    pub fn new(kind: OpKind, base: Mesh, faces: BTreeSet<usize>, edges: BTreeSet<(u32, u32)>) -> Self {
+        OpModal { kind, base, faces, edges, start_mouse: None, value: 0.0 }
+    }
+}
+
+/// A loop cut being placed: first hover an edge and click, then (for a single cut) slide it and click again.
+pub struct LoopCut {
+    cuts: usize,
+    /// Set once the ring is chosen: the ring and the edge the slide is measured along.
+    slide: Option<(EdgeRing, (u32, u32))>,
+    t: f32,
+}
+
+impl LoopCut {
+    pub fn new() -> Self {
+        LoopCut { cuts: 1, slide: None, t: 0.5 }
+    }
+}
+
+/// Lines and points to draw over the scene (loop cut preview).
+#[derive(Default)]
+struct Preview {
+    lines: Vec<[Vec3; 2]>,
+    points: Vec<Vec3>,
 }
 
 /// A selection of whatever the current mode selects.
@@ -217,6 +262,155 @@ impl App {
         })
     }
 
+    /// Inset / bevel: amount follows the mouse (right = more).
+    fn op_step(&mut self, ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect, mouse: Option<Pos2>, snap: bool, keys: bool) {
+        let Some(mut op) = self.op.take() else { return };
+        let key = |k: Key| keys && ui.input(|i| i.key_pressed(k));
+        if key(Key::Escape) || resp.clicked_by(PointerButton::Secondary) {
+            self.revert_last();
+            return;
+        }
+        if let Some(mouse) = mouse {
+            let start = *op.start_mouse.get_or_insert(mouse);
+            // Scale mouse travel by the zoom level at the selection so the feel is the same near and far.
+            let verts: BTreeSet<u32> = op.base.verts_of_faces(&op.faces).into_iter().chain(op.edges.iter().flat_map(|&(a, b)| [a, b])).collect();
+            let pivot = verts.iter().map(|&v| op.base.positions[v as usize]).sum::<Vec3>() / verts.len().max(1) as f32;
+            let mut value = ((mouse.x - start.x) * self.camera.units_per_pixel(rect, pivot)).max(0.0);
+            if snap {
+                value = (value / self.grid_snap).round() * self.grid_snap;
+            }
+            op.value = value;
+            let mut mesh = op.base.clone();
+            let result_faces = match op.kind {
+                OpKind::Inset => {
+                    mesh.inset_faces(&op.faces, value);
+                    op.faces.clone()
+                }
+                OpKind::Bevel => mesh.bevel_edges(&op.edges, value),
+            };
+            // Keep the selection valid for the rebuilt mesh: the inset faces, or the new bevel faces.
+            let fallback = if op.kind == OpKind::Inset || value > 0.0 { result_faces } else { BTreeSet::new() };
+            self.sel_verts = mesh.verts_of_faces(&fallback);
+            self.sel_faces = fallback;
+            *self.mesh_mut() = mesh;
+        }
+        if key(Key::Enter) || resp.clicked_by(PointerButton::Primary) {
+            if op.value <= 0.0 {
+                // Nothing was changed: drop the undo step again.
+                self.revert_last();
+            }
+            return;
+        }
+        self.op = Some(op);
+    }
+
+    /// The edge a loop cut should start from: the nearest edge of the face under the cursor,
+    /// or failing that the nearest edge on screen.
+    fn pick_edge(&self, rect: egui::Rect, pos: Pos2) -> Option<(u32, u32)> {
+        let mesh = self.mesh();
+        let dist = |&(a, b): &(u32, u32)| -> Option<f32> {
+            let pa = self.camera.project(rect, mesh.positions[a as usize])?;
+            let pb = self.camera.project(rect, mesh.positions[b as usize])?;
+            Some(segment_distance(pos, pa, pb))
+        };
+        let nearest = |edges: Vec<(u32, u32)>, limit: f32| {
+            edges.into_iter()
+                .filter_map(|e| dist(&e).map(|d| (e, d)))
+                .filter(|(_, d)| *d <= limit)
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(e, _)| e)
+        };
+        let (o, d) = self.camera.ray(rect, pos);
+        match mesh.raycast(o, d) {
+            Some((f, _)) => {
+                let v = &mesh.faces[f].verts;
+                nearest((0..v.len()).map(|i| (v[i], v[(i + 1) % v.len()])).collect(), f32::MAX)
+            }
+            None => nearest(mesh.edges(), 14.0),
+        }
+    }
+
+    fn loop_cut_step(&mut self, ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect, mouse: Option<Pos2>, snap: bool, keys: bool) -> Preview {
+        let Some(mut lc) = self.loop_cut.take() else { return Preview::default() };
+        let key = |k: Key| keys && ui.input(|i| i.key_pressed(k));
+        if key(Key::Escape) || resp.clicked_by(PointerButton::Secondary) {
+            return Preview::default();
+        }
+        let confirm = resp.clicked_by(PointerButton::Primary);
+        let enter = key(Key::Enter);
+        let preview_of = |mesh: &Mesh, ring: &EdgeRing, fractions: &[f32]| {
+            let mut pv = Preview::default();
+            for &t in fractions {
+                let pts: Vec<Vec3> = ring.edges.iter().map(|&(a, b)| mesh.positions[a as usize].lerp(mesh.positions[b as usize], t)).collect();
+                pv.lines.extend(pts.windows(2).map(|w| [w[0], w[1]]));
+                if ring.closed && pts.len() > 2 {
+                    pv.lines.push([pts[pts.len() - 1], pts[0]]);
+                }
+                pv.points.extend(pts);
+            }
+            pv
+        };
+
+        match lc.slide.take() {
+            // Phase 1: choose the ring by hovering an edge; number keys set how many cuts.
+            None => {
+                let digits = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
+                if let Some(n) = digits.iter().position(|&k| key(k)) {
+                    lc.cuts = n + 1;
+                }
+                let hover = mouse.filter(|m| rect.contains(*m)).and_then(|m| self.pick_edge(rect, m));
+                let mut preview = Preview::default();
+                if let Some((a, b)) = hover {
+                    let ring = self.mesh().edge_ring(a, b);
+                    let fractions: Vec<f32> = (1..=lc.cuts).map(|j| j as f32 / (lc.cuts + 1) as f32).collect();
+                    preview = preview_of(self.mesh(), &ring, &fractions);
+                    if confirm && lc.cuts == 1 {
+                        lc.slide = Some((ring, (a, b)));
+                        lc.t = 0.5;
+                    } else if confirm || enter {
+                        self.apply_loop_cut(&ring, &fractions);
+                        return Preview::default();
+                    }
+                }
+                self.loop_cut = Some(lc);
+                preview
+            }
+            // Phase 2 (single cut): slide it along the chosen edge.
+            Some((ring, (a, b))) => {
+                let (pa, pb) = (self.mesh().positions[a as usize], self.mesh().positions[b as usize]);
+                if let (Some(m), Some(sa), Some(sb)) = (mouse, self.camera.project(rect, pa), self.camera.project(rect, pb)) {
+                    let mut t = ((m - sa).dot(sb - sa) / (sb - sa).length_sq().max(1e-6)).clamp(0.02, 0.98);
+                    if snap {
+                        // Snap the distance from the start of the edge to the grid step.
+                        let len = pa.distance(pb);
+                        let d = (t * len / self.grid_snap).round() * self.grid_snap;
+                        if d > 1e-5 && d < len - 1e-5 {
+                            t = d / len;
+                        }
+                    }
+                    lc.t = t;
+                }
+                if confirm || enter {
+                    self.apply_loop_cut(&ring, &[lc.t]);
+                    return Preview::default();
+                }
+                let preview = preview_of(self.mesh(), &ring, &[lc.t]);
+                lc.slide = Some((ring, (a, b)));
+                self.loop_cut = Some(lc);
+                preview
+            }
+        }
+    }
+
+    fn apply_loop_cut(&mut self, ring: &EdgeRing, fractions: &[f32]) {
+        self.push_undo();
+        let new = self.mesh_mut().loop_cut(ring, fractions);
+        // Leave the new loop selected so it can be moved straight away.
+        self.set_mode(SelMode::Vertex);
+        self.sel_verts = new.into_iter().collect();
+        self.status = "Loop cut added (new vertices selected).".into();
+    }
+
     fn modal_keys(&mut self, ui: &egui::Ui) {
         let Some(m) = &mut self.modal else { return };
         let pressed = |k: Key| ui.input(|i| i.key_pressed(k));
@@ -251,7 +445,14 @@ impl App {
     fn viewport_keys(&mut self, ui: &egui::Ui) {
         let (shift, alt) = ui.input(|i| (i.modifiers.shift, i.modifiers.alt));
         let pressed = |k: Key| ui.input(|i| i.key_pressed(k) && !i.modifiers.command);
-        if pressed(Key::G) {
+        let ctrl = |k: Key| ui.input(|i| i.key_pressed(k) && i.modifiers.command && !i.modifiers.shift);
+        if ctrl(Key::B) {
+            self.start_bevel();
+        } else if ctrl(Key::R) {
+            self.start_loop_cut();
+        } else if pressed(Key::I) {
+            self.start_inset();
+        } else if pressed(Key::G) {
             self.start_modal(ModalKind::Grab, None);
         } else if pressed(Key::R) {
             self.start_modal(ModalKind::Rotate, None);
@@ -531,10 +732,11 @@ impl App {
 
         // ---- tools
         let mut box_rect: Option<egui::Rect> = None;
+        let mut preview = Preview::default();
         // Snapping is on when the toggle is set; holding Ctrl flips it for the moment.
         let snap = self.snap_on != mods.command;
         let keyboard_free = !ui.ctx().egui_wants_keyboard_input();
-        let gizmo_before = if self.show_gizmo && self.modal.is_none() { self.gizmo(rect) } else { None };
+        let gizmo_before = if self.show_gizmo && !self.busy() { self.gizmo(rect) } else { None };
         let over_gizmo = |p: Option<Pos2>| gizmo_before.as_ref().zip(p).and_then(|(g, p)| g.hit(p));
 
         if let Some(is_drag) = self.modal.as_ref().map(|m| m.drag) {
@@ -549,6 +751,12 @@ impl App {
             } else if (is_drag && !primary_down) || (!is_drag && resp.clicked_by(PointerButton::Primary)) {
                 self.modal = None;
             }
+            ui.ctx().request_repaint();
+        } else if self.op.is_some() {
+            self.op_step(ui, &resp, rect, mouse, snap, keyboard_free);
+            ui.ctx().request_repaint();
+        } else if self.loop_cut.is_some() {
+            preview = self.loop_cut_step(ui, &resp, rect, mouse, snap, keyboard_free);
             ui.ctx().request_repaint();
         } else {
             if resp.hovered() && keyboard_free {
@@ -631,7 +839,7 @@ impl App {
 
         // ---- draw gizmo on top (recomputed so it follows the selection while dragging)
         let dragging_axis = self.modal.as_ref().filter(|m| m.drag).and_then(|m| AXES.iter().position(|a| Some(a.0) == m.axis));
-        let show = self.show_gizmo && self.modal.as_ref().is_none_or(|m| m.drag);
+        let show = self.show_gizmo && self.modal.as_ref().is_none_or(|m| m.drag) && self.op.is_none() && self.loop_cut.is_none();
         if let Some(g) = show.then(|| self.gizmo(rect)).flatten() {
             let hovered = dragging_axis.or_else(|| resp.hover_pos().and_then(|p| g.hit(p)));
             // Far arrows first so near ones overlap them.
@@ -660,7 +868,18 @@ impl App {
             clip.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(255, 170, 60, 25));
             clip.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgb(255, 190, 90)), egui::StrokeKind::Middle);
         }
-        if self.select_tool == SelectTool::Circle && self.modal.is_none() {
+        let cut_color = Color32::from_rgb(255, 230, 70);
+        for [a, b] in &preview.lines {
+            if let (Some(a), Some(b)) = (self.camera.project(rect, *a), self.camera.project(rect, *b)) {
+                clip.line_segment([a, b], Stroke::new(2.0, cut_color));
+            }
+        }
+        for p in &preview.points {
+            if let Some(p) = self.camera.project(rect, *p) {
+                clip.circle_filled(p, 3.0, cut_color);
+            }
+        }
+        if self.select_tool == SelectTool::Circle && !self.busy() {
             if let Some(p) = resp.hover_pos() {
                 clip.circle_stroke(p, self.circle_radius, Stroke::new(1.0, Color32::from_rgb(255, 190, 90)));
             }
@@ -668,7 +887,21 @@ impl App {
 
         // ---- overlay text
         let font = egui::FontId::proportional(13.0);
+        let snap_note = if snap { format!("   snap {}", self.grid_snap) } else { String::new() };
+        let tool_hint = if let Some(op) = &self.op {
+            let what = if op.kind == OpKind::Inset { "Inset" } else { "Bevel" };
+            Some(format!("{what}:  {:.3}{snap_note}    move the mouse right for more   [Ctrl] flip snap   [Click/Enter] confirm   [Esc/Right-click] cancel", op.value))
+        } else if let Some(lc) = &self.loop_cut {
+            Some(if lc.slide.is_some() {
+                format!("Loop cut: slide {:.0}%{snap_note}    [Click/Enter] confirm   [Ctrl] flip snap   [Esc/Right-click] cancel", lc.t * 100.0)
+            } else {
+                format!("Loop cut: hover an edge and click   cuts: {}   [1-9] number of cuts   [Esc/Right-click] cancel", lc.cuts)
+            })
+        } else {
+            None
+        };
         let hint = match &self.modal {
+            _ if tool_hint.is_some() => tool_hint.unwrap(),
             Some(m) => {
                 let what = match m.kind {
                     ModalKind::Grab => "Move",

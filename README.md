@@ -60,6 +60,24 @@ hidden behind geometry; untick it to select straight through the mesh.
   (Rotation snaps to 15 degrees, scale to 0.1.)
 - **Keyboard**: G / R / S as below.
 
+## Inset, bevel, loop cut
+
+All three work on the object being edited (Tab into vertex / face mode first).
+
+- **Inset (I)**: shrinks the selected faces inwards and leaves a rim of
+  new faces. Several selected faces inset together as one region.
+- **Bevel (Ctrl+B)**: chamfers edges. In face mode it takes every edge of
+  the selected faces; in vertex mode every edge whose two ends are selected.
+- **Loop cut (Ctrl+R)**: hover an edge and a yellow preview shows the cut
+  running round the ring of quads. Press 1-9 for the number of cuts, click
+  to place. A single cut can then be slid along the edge; click again to
+  confirm. The new loop is left selected in vertex mode.
+
+Inset and bevel are sized by moving the mouse to the right; click or Enter
+confirms, Esc or right-click cancels. Snapping ("Snap every" / Ctrl) applies
+to the inset and bevel width and to the loop-cut slide distance. Existing
+faces keep their texture exactly in place through all three.
+
 ## 3D viewport
 
 | Input | Action |
@@ -74,6 +92,7 @@ hidden behind geometry; untick it to select straight through the mesh.
 | A / Alt+A / L | Select all / none / linked (edit modes) |
 | G / R / S | Move / rotate / scale. Then X, Y, Z to lock an axis, click or Enter to confirm, Esc or right-click to cancel |
 | E | Extrude selected faces along their normal |
+| I / Ctrl+B / Ctrl+R | Inset / bevel / loop cut |
 | Shift+D | Duplicate (object or faces) |
 | X or Delete | Delete (object or faces / vertices) |
 | U | Show / hide the UV editor |
