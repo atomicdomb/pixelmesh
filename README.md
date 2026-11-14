@@ -202,6 +202,16 @@ share the same zoom and pan.
 | Picker | I | Picks a colour (left: foreground, right: background). Alt with any tool does the same |
 | Line | L | Drag for a straight line |
 | Rect | U | Drag for a rectangle; "Filled rect" fills it |
+| Select | M | Drag a rectangular selection. Shift adds, Ctrl removes, a single click deselects |
+| Wand | W | Selects the connected area of one colour. Shift adds, Ctrl removes |
+
+**Selections**: while pixels are selected (dashed outline), every paint
+tool only changes those pixels: strokes are clipped to the selection and
+Fill stops at its edge. The "Selection" row has All (Ctrl+A), None (Ctrl+D
+or Esc), Invert (Ctrl+Shift+I) and **From UV faces**, which selects the
+pixels covered by the faces currently shown in the UV tab, so you can paint
+one face of the model without spilling onto its neighbours. Delete makes
+the selected pixels transparent.
 
 Other controls: `[` / `]` brush size, X swaps the two colours, scroll
 zooms, middle-drag or Space+drag pans, Ctrl+Z / Ctrl+Shift+Z undo and redo
@@ -248,8 +258,21 @@ imports FBX files written by Blender (`tests/fixtures`).
 - `src/fbx.rs` - FBX writer
 - `src/fbx_import.rs` - FBX reader (via ufbx)
 - `src/app.rs` - state, menus, files
-- `src/sidebar.rs`, `src/icons.rs` - tool panel, theme and the pixel-art icons (drawn in code;
-  `cargo run --example icon_sheet -- icons.png` renders them all for review)
+- `src/sidebar.rs`, `src/icons.rs` - tool panel, theme and icons
+
+## Editing the icons
+
+The interface icons live in `assets/icons.png`: a grid of 16x16 cells, 11
+per row, compiled into the program. Edit that file in any pixel editor
+(including this one's Paint tab), keep each icon inside its cell, and run
+`cargo run` again to see the result. The order of the cells is the `ALL`
+list in `src/icons.rs`; new icons are always added at the end, so existing
+cells never move.
+
+`cargo run --example icon_sheet -- preview.png` writes an enlarged preview
+of the built-in drawings. Adding `--atlas` and pointing it at
+`assets/icons.png` resets the file to those built-in drawings, overwriting
+any edits.
 - `src/viewport.rs` - 3D view, picking, modal transforms
 - `src/uv_editor.rs` - UV editor
 - `src/paint.rs`, `src/pixels.rs` - paint tab and its pixel operations (unit tested)

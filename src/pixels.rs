@@ -68,43 +68,82 @@ pub fn rect(data: &mut [u8], w: u32, h: u32, a: (i32, i32), b: (i32, i32), fille
     }
 }
 
-/// Replace the 4-connected area of identical colour around (x, y).
-pub fn flood_fill(data: &mut [u8], w: u32, h: u32, x: i32, y: i32, c: Rgba) {
-    let Some(target) = get(data, w, h, x, y) else { return };
-    if target == c {
-        return;
-    }
+/// The 4-connected area of identical colour around (x, y), as one flag per pixel.
+/// With `allowed`, pixels outside that mask act as walls (and a start outside it gives nothing).
+pub fn flood_region(data: &[u8], w: u32, h: u32, x: i32, y: i32, allowed: Option<&[bool]>) -> Vec<bool> {
+    let mut region = vec![false; (w * h) as usize];
+    let Some(target) = get(data, w, h, x, y) else { return region };
+    let open = |px: i32, py: i32, region: &[bool]| {
+        index(w, h, px, py).is_some_and(|i| {
+            let k = i / 4;
+            !region[k] && allowed.is_none_or(|m| m[k]) && data[i..i + 4] == target
+        })
+    };
     let mut stack = vec![(x, y)];
     while let Some((px, py)) = stack.pop() {
-        if get(data, w, h, px, py) != Some(target) {
+        if !open(px, py, &region) {
             continue;
         }
-        // Fill a whole horizontal run at once, then queue the rows above and below.
-        let (mut l, mut r) = (px, px);
-        while get(data, w, h, l - 1, py) == Some(target) {
-            l -= 1;
-        }
-        while get(data, w, h, r + 1, py) == Some(target) {
-            r += 1;
-        }
-        for fx in l..=r {
-            set(data, w, h, fx, py, c);
-        }
-        for ny in [py - 1, py + 1] {
-            let mut fx = l;
-            while fx <= r {
-                if get(data, w, h, fx, ny) == Some(target) {
-                    stack.push((fx, ny));
-                    // Skip the rest of this run; one seed per run is enough.
-                    while fx <= r && get(data, w, h, fx, ny) == Some(target) {
-                        fx += 1;
-                    }
-                } else {
-                    fx += 1;
+        region[py as usize * w as usize + px as usize] = true;
+        stack.extend([(px + 1, py), (px - 1, py), (px, py + 1), (px, py - 1)]);
+    }
+    region
+}
+
+/// Replace the 4-connected area of identical colour around (x, y), staying inside `allowed` if given.
+pub fn flood_fill(data: &mut [u8], w: u32, h: u32, x: i32, y: i32, c: Rgba, allowed: Option<&[bool]>) {
+    if get(data, w, h, x, y) == Some(c) {
+        return;
+    }
+    let region = flood_region(data, w, h, x, y, allowed);
+    for (k, _) in region.iter().enumerate().filter(|(_, inside)| **inside) {
+        data[k * 4..k * 4 + 4].copy_from_slice(&c);
+    }
+}
+
+/// Put back every pixel outside `mask` from `original` (used to confine a stroke to a selection).
+pub fn restore_outside(data: &mut [u8], original: &[u8], mask: &[bool]) {
+    for (k, _) in mask.iter().enumerate().filter(|(_, selected)| !**selected) {
+        data[k * 4..k * 4 + 4].copy_from_slice(&original[k * 4..k * 4 + 4]);
+    }
+}
+
+/// Outline of a selection as horizontal and vertical segments on the pixel grid
+/// (corner coordinates), with straight runs merged.
+pub fn mask_outline(mask: &[bool], w: u32, h: u32) -> Vec<[(i32, i32); 2]> {
+    let (w, h) = (w as i32, h as i32);
+    let at = |x: i32, y: i32| x >= 0 && y >= 0 && x < w && y < h && mask[(y * w + x) as usize];
+    let mut segments = Vec::new();
+    // Horizontal edges: between row y-1 and row y.
+    for y in 0..=h {
+        let mut start = None;
+        for x in 0..=w {
+            let edge = x < w && at(x, y - 1) != at(x, y);
+            match (edge, start) {
+                (true, None) => start = Some(x),
+                (false, Some(s)) => {
+                    segments.push([(s, y), (x, y)]);
+                    start = None;
                 }
+                _ => {}
             }
         }
     }
+    for x in 0..=w {
+        let mut start = None;
+        for y in 0..=h {
+            let edge = y < h && at(x - 1, y) != at(x, y);
+            match (edge, start) {
+                (true, None) => start = Some(y),
+                (false, Some(s)) => {
+                    segments.push([(x, s), (x, y)]);
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+    }
+    segments
 }
 
 /// Distinct visible colours in the image, most used first, at most `max`.
@@ -171,15 +210,57 @@ mod tests {
     fn fill_stops_at_borders() {
         let mut d = vec![0u8; 8 * 8 * 4];
         rect(&mut d, 8, 8, (1, 1), (5, 5), false, 1, R);
-        flood_fill(&mut d, 8, 8, 3, 3, G);
+        flood_fill(&mut d, 8, 8, 3, 3, G, None);
         assert_eq!(count(&d, G), 9);
         assert_eq!(count(&d, R), 16);
         // Outside area: everything that is still clear, including around the corner.
-        flood_fill(&mut d, 8, 8, 7, 7, G);
+        flood_fill(&mut d, 8, 8, 7, 7, G, None);
         assert_eq!(count(&d, CLEAR), 0);
         // Filling with the colour already there is a no-op (and must terminate).
-        flood_fill(&mut d, 8, 8, 0, 0, G);
+        flood_fill(&mut d, 8, 8, 0, 0, G, None);
         assert_eq!(count(&d, G), 64 - 16);
+    }
+
+    #[test]
+    fn selection_confines_painting() {
+        // Select the left half of an 8x8 image.
+        let mask: Vec<bool> = (0..64).map(|i| i % 8 < 4).collect();
+        let original = vec![0u8; 8 * 8 * 4];
+
+        // A fill started inside the selection stops at its edge...
+        let mut d = original.clone();
+        flood_fill(&mut d, 8, 8, 1, 1, R, Some(&mask));
+        assert_eq!(count(&d, R), 32);
+        assert_eq!(get(&d, 8, 8, 4, 0), Some(CLEAR));
+        // ...and one started outside it does nothing.
+        flood_fill(&mut d, 8, 8, 6, 6, G, Some(&mask));
+        assert_eq!(count(&d, G), 0);
+
+        // A stroke across the whole image only leaves its selected part behind.
+        let mut d = original.clone();
+        line(&mut d, 8, 8, (0, 3), (7, 3), 1, G);
+        restore_outside(&mut d, &original, &mask);
+        assert_eq!(count(&d, G), 4);
+        assert_eq!(get(&d, 8, 8, 3, 3), Some(G));
+        assert_eq!(get(&d, 8, 8, 4, 3), Some(CLEAR));
+
+        // Magic wand: the connected area of one colour.
+        let mut d = original.clone();
+        rect(&mut d, 8, 8, (1, 1), (5, 5), false, 1, R);
+        let inside = flood_region(&d, 8, 8, 3, 3, None);
+        assert_eq!(inside.iter().filter(|b| **b).count(), 9);
+        let ring = flood_region(&d, 8, 8, 1, 1, None);
+        assert_eq!(ring.iter().filter(|b| **b).count(), 16);
+    }
+
+    #[test]
+    fn outline_of_a_rectangle_is_four_segments() {
+        let mask: Vec<bool> = (0..64).map(|i| (2..6).contains(&(i % 8)) && (1..4).contains(&(i / 8))).collect();
+        let mut o = mask_outline(&mask, 8, 8);
+        o.sort();
+        assert_eq!(o, vec![[(2, 1), (2, 4)], [(2, 1), (6, 1)], [(2, 4), (6, 4)], [(6, 1), (6, 4)]]);
+        // Selecting everything outlines the image border.
+        assert_eq!(mask_outline(&vec![true; 64], 8, 8).len(), 4);
     }
 
     #[test]

@@ -16,15 +16,40 @@ pub enum Tool {
     Picker,
     Line,
     Rect,
+    /// Rectangular selection.
+    Select,
+    /// Select the connected area of one colour.
+    Wand,
 }
 
-const TOOLS: [(Tool, Icon, &str, &str); 6] = [
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelOp {
+    Replace,
+    Add,
+    Subtract,
+}
+
+/// Combine a new region with the selection that was there before.
+fn combine(base: &Option<Vec<bool>>, region: Vec<bool>, op: SelOp) -> Option<Vec<bool>> {
+    let merged: Vec<bool> = match (base, op) {
+        (Some(b), SelOp::Add) => b.iter().zip(&region).map(|(a, r)| *a || *r).collect(),
+        // Removing from "nothing selected" means removing from everything.
+        (None, SelOp::Subtract) => region.iter().map(|r| !*r).collect(),
+        (Some(b), SelOp::Subtract) => b.iter().zip(&region).map(|(a, r)| *a && !*r).collect(),
+        _ => region,
+    };
+    merged.iter().any(|m| *m).then_some(merged)
+}
+
+const TOOLS: [(Tool, Icon, &str, &str); 8] = [
     (Tool::Pencil, Icon::Pencil, "Pencil", "Pencil  (B)\nLeft button paints the foreground colour, right button the background colour"),
     (Tool::Eraser, Icon::Eraser, "Eraser", "Eraser  (E)\nMakes pixels transparent"),
     (Tool::Fill, Icon::Fill, "Fill", "Fill  (G)\nFills the connected area of one colour"),
     (Tool::Picker, Icon::Picker, "Picker", "Colour picker  (I)\nHolding Alt with any tool does the same"),
     (Tool::Line, Icon::Line, "Line", "Line  (L)\nDrag to draw a straight line"),
     (Tool::Rect, Icon::Rect, "Rect", "Rectangle  (U)\nDrag to draw a rectangle"),
+    (Tool::Select, Icon::BoxSelect, "Select", "Select  (M)\nDrag a rectangle; painting then only affects the selected pixels.\nShift adds, Ctrl removes, a single click deselects"),
+    (Tool::Wand, Icon::Wand, "Wand", "Magic wand  (W)\nSelects the connected area of one colour. Shift adds, Ctrl removes"),
 ];
 
 /// A small general-purpose starting palette.
@@ -45,6 +70,10 @@ struct StrokeState {
     /// Pixels before the stroke: restored each frame for line / rectangle previews, and kept for undo.
     base: Arc<Vec<u8>>,
     size: [u32; 2],
+    /// Selection tools: how the new region combines, and the selection before the drag.
+    op: SelOp,
+    base_selection: Option<Vec<bool>>,
+    moved: bool,
 }
 
 struct NewCanvas {
@@ -67,6 +96,11 @@ pub struct Paint {
     /// Colours found in the image, and the texture version they were collected from.
     used: (u64, Vec<Rgba>),
     checker: Option<egui::TextureHandle>,
+    /// One flag per pixel; None = no selection, everything can be painted.
+    selection: Option<Vec<bool>>,
+    /// Outline of the selection on the pixel grid, rebuilt when the selection changes.
+    outline: Vec<[(i32, i32); 2]>,
+    outline_dirty: bool,
 }
 
 impl Default for Paint {
@@ -83,6 +117,9 @@ impl Default for Paint {
             new_dialog: None,
             used: (0, Vec::new()),
             checker: None,
+            selection: None,
+            outline: Vec::new(),
+            outline_dirty: false,
         }
     }
 }
@@ -96,6 +133,11 @@ impl Paint {
     pub fn is_painting(&self) -> bool {
         self.stroke.is_some()
     }
+
+    fn set_selection(&mut self, selection: Option<Vec<bool>>) {
+        self.selection = selection;
+        self.outline_dirty = true;
+    }
 }
 
 fn color32(c: Rgba) -> Color32 {
@@ -106,7 +148,7 @@ impl App {
     fn paint_toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            let w = ((ui.available_width() - 4.0 * 5.0) / 6.0).floor().min(64.0);
+            let w = ((ui.available_width() - 4.0 * 7.0) / 8.0).floor().min(64.0);
             for (tool, icon, label, tip) in TOOLS {
                 if self.tile(ui, icon, label, self.paint.tool == tool, w).on_hover_text(tip).clicked() {
                     self.paint.tool = tool;
@@ -143,6 +185,31 @@ impl App {
             }
         });
 
+        // Selection commands.
+        let size = self.texture.as_ref().map(|t| t.size);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.label("Selection");
+            ui.add_enabled_ui(size.is_some(), |ui| {
+                if ui.small_button("All").on_hover_text("Ctrl+A").clicked() {
+                    self.paint_select_all();
+                }
+                if ui.small_button("None").on_hover_text("Ctrl+D or Esc").clicked() {
+                    self.paint.set_selection(None);
+                }
+                if ui.small_button("Invert").on_hover_text("Ctrl+Shift+I").clicked() {
+                    self.paint_invert_selection();
+                }
+                if ui.small_button("From UV faces").on_hover_text("Select the pixels covered by the faces shown in the UV tab, so you can paint just those faces. Shift adds to the selection.").clicked() {
+                    let add = ui.input(|i| i.modifiers.shift);
+                    self.paint_select_uv_faces(add);
+                }
+            });
+            if let Some(sel) = &self.paint.selection {
+                ui.weak(format!("{} px", sel.iter().filter(|s| **s).count()));
+            }
+        });
+
         // Palette: fixed starter colours, then the colours already in the image.
         if let Some(t) = &self.texture {
             if self.paint.used.0 != t.version && self.paint.stroke.is_none() {
@@ -164,6 +231,68 @@ impl App {
                 }
             }
         });
+    }
+
+    fn paint_select_all(&mut self) {
+        if let Some(t) = &self.texture {
+            let all = vec![true; (t.size[0] * t.size[1]) as usize];
+            self.paint.set_selection(Some(all));
+        }
+    }
+
+    fn paint_invert_selection(&mut self) {
+        let Some(t) = &self.texture else { return };
+        let inverted = match &self.paint.selection {
+            Some(sel) => combine(&None, sel.iter().map(|s| !*s).collect(), SelOp::Replace),
+            // Inverting "nothing" selects everything.
+            None => Some(vec![true; (t.size[0] * t.size[1]) as usize]),
+        };
+        self.paint.set_selection(inverted);
+    }
+
+    /// Select the pixels under the UVs of the faces the UV tab is showing.
+    fn paint_select_uv_faces(&mut self, add: bool) {
+        let Some(t) = &self.texture else { return };
+        let (w, h) = (t.size[0] as i32, t.size[1] as i32);
+        let faces = self.active_faces();
+        let mut region = vec![false; (w * h) as usize];
+        for &f in &faces {
+            // Face outline in pixel coordinates (row 0 at the top).
+            let poly: Vec<Vec2> = self.mesh().faces[f].uvs.iter().map(|uv| Vec2::new(uv.x * w as f32, (1.0 - uv.y) * h as f32)).collect();
+            let lo = poly.iter().fold(Vec2::splat(f32::MAX), |a, p| a.min(*p));
+            let hi = poly.iter().fold(Vec2::splat(f32::MIN), |a, p| a.max(*p));
+            for y in (lo.y.floor() as i32).max(0)..(hi.y.ceil() as i32).min(h) {
+                for x in (lo.x.floor() as i32).max(0)..(hi.x.ceil() as i32).min(w) {
+                    // A pixel belongs to the face when its centre is inside the outline.
+                    if point_in_polygon(Vec2::new(x as f32 + 0.5, y as f32 + 0.5), &poly) {
+                        region[(y * w + x) as usize] = true;
+                    }
+                }
+            }
+        }
+        if !region.iter().any(|r| *r) {
+            self.status = "No pixels under those faces: select an object or faces in the 3D view first.".into();
+            return;
+        }
+        let op = if add { SelOp::Add } else { SelOp::Replace };
+        let selection = combine(&self.paint.selection, region, op);
+        self.paint.set_selection(selection);
+    }
+
+    /// Delete key: make the selected pixels transparent.
+    fn paint_clear_selection(&mut self) {
+        let Some(sel) = self.paint.selection.clone() else { return };
+        let Some(t) = self.texture.as_mut() else { return };
+        let before = t.rgba.clone();
+        let size = t.size;
+        let data = Arc::make_mut(&mut t.rgba);
+        for (k, _) in sel.iter().enumerate().filter(|(_, s)| **s) {
+            data[k * 4..k * 4 + 4].copy_from_slice(&[0, 0, 0, 0]);
+        }
+        if *t.rgba != *before {
+            self.push_pixels_undo(before, size);
+            self.texture_changed();
+        }
     }
 
     fn new_canvas_dialog(&mut self, ctx: &egui::Context) {
@@ -243,11 +372,26 @@ impl App {
             Rect::from_two_pos(a, b)
         };
 
+        // A selection made for another image size no longer means anything.
+        if self.paint.selection.as_ref().is_some_and(|s| s.len() != (w * h) as usize) {
+            self.paint.set_selection(None);
+        }
+
         // ---- keys
         let keyboard_free = !ctx.egui_wants_keyboard_input();
         if resp.hovered() && keyboard_free && self.paint.stroke.is_none() {
             let key = |k: Key| ui.input(|i| i.key_pressed(k) && !i.modifiers.command);
-            for (k, tool) in [(Key::B, Tool::Pencil), (Key::E, Tool::Eraser), (Key::G, Tool::Fill), (Key::I, Tool::Picker), (Key::L, Tool::Line), (Key::U, Tool::Rect)] {
+            let ctrl = |k: Key, shift: bool| ui.input(|i| i.key_pressed(k) && i.modifiers.command && i.modifiers.shift == shift);
+            if ctrl(Key::A, false) {
+                self.paint_select_all();
+            } else if ctrl(Key::D, false) || key(Key::Escape) {
+                self.paint.set_selection(None);
+            } else if ctrl(Key::I, true) {
+                self.paint_invert_selection();
+            } else if key(Key::Delete) || key(Key::Backspace) {
+                self.paint_clear_selection();
+            }
+            for (k, tool) in [(Key::B, Tool::Pencil), (Key::E, Tool::Eraser), (Key::G, Tool::Fill), (Key::I, Tool::Picker), (Key::L, Tool::Line), (Key::U, Tool::Rect), (Key::M, Tool::Select), (Key::W, Tool::Wand)] {
                 if key(k) {
                     self.paint.tool = tool;
                 }
@@ -277,7 +421,11 @@ impl App {
                     _ if secondary => self.paint.bg,
                     _ => self.paint.fg,
                 };
-                self.paint.stroke = Some(StrokeState { tool, color, secondary, start: pixel_at(mouse), last: None, base: t.rgba.clone(), size: t.size });
+                let op = if mods.command { SelOp::Subtract } else if mods.shift { SelOp::Add } else { SelOp::Replace };
+                self.paint.stroke = Some(StrokeState {
+                    tool, color, secondary, start: pixel_at(mouse), last: None, base: t.rgba.clone(), size: t.size,
+                    op, base_selection: self.paint.selection.clone(), moved: false,
+                });
             }
         }
 
@@ -290,7 +438,27 @@ impl App {
                 let cur = pixel_at(mouse);
                 if stroke.last != Some(cur) {
                     let brush = self.paint.brush;
+                    let mask = self.paint.selection.as_deref();
+                    stroke.moved |= stroke.last.is_some();
+                    let mut new_selection = None;
                     match stroke.tool {
+                        Tool::Select => {
+                            let (x0, x1) = (stroke.start.0.min(cur.0).max(0), stroke.start.0.max(cur.0).min(w as i32 - 1));
+                            let (y0, y1) = (stroke.start.1.min(cur.1).max(0), stroke.start.1.max(cur.1).min(h as i32 - 1));
+                            let mut region = vec![false; (w * h) as usize];
+                            for y in y0..=y1 {
+                                for x in x0..=x1 {
+                                    region[(y as u32 * w + x as u32) as usize] = true;
+                                }
+                            }
+                            new_selection = Some(combine(&stroke.base_selection, region, stroke.op));
+                        }
+                        Tool::Wand => {
+                            if stroke.last.is_none() {
+                                let region = pixels::flood_region(&t.rgba, w, h, cur.0, cur.1, None);
+                                new_selection = Some(combine(&stroke.base_selection, region, stroke.op));
+                            }
+                        }
                         Tool::Pencil | Tool::Eraser => {
                             let data = Arc::make_mut(&mut t.rgba);
                             pixels::line(data, w, h, stroke.last.unwrap_or(cur), cur, brush, stroke.color);
@@ -310,7 +478,7 @@ impl App {
                         Tool::Fill => {
                             if stroke.last.is_none() {
                                 let data = Arc::make_mut(&mut t.rgba);
-                                pixels::flood_fill(data, w, h, cur.0, cur.1, stroke.color);
+                                pixels::flood_fill(data, w, h, cur.0, cur.1, stroke.color, mask);
                                 changed = true;
                             }
                         }
@@ -324,12 +492,23 @@ impl App {
                             }
                         }
                     }
+                    // With a selection, whatever the tool drew outside it is put back.
+                    if let (true, Some(mask)) = (changed, mask) {
+                        let data = Arc::make_mut(&mut t.rgba);
+                        pixels::restore_outside(data, &stroke.base, mask);
+                    }
+                    if let Some(sel) = new_selection {
+                        self.paint.set_selection(sel);
+                    }
                     stroke.last = Some(cur);
                 }
             }
             if held {
                 self.paint.stroke = Some(stroke);
                 ctx.request_repaint();
+            } else if stroke.tool == Tool::Select && !stroke.moved && stroke.op == SelOp::Replace {
+                // A plain click with the select tool clears the selection.
+                self.paint.set_selection(None);
             } else if self.texture.as_ref().is_some_and(|t| *t.rgba != *stroke.base) {
                 // One undo step per stroke.
                 self.push_pixels_undo(stroke.base, stroke.size);
@@ -386,11 +565,29 @@ impl App {
             }
         }
 
+        // ---- selection outline: dark line with light dashes on top, so it shows on any colour
+        if self.paint.outline_dirty {
+            self.paint.outline = match &self.paint.selection {
+                Some(sel) if sel.len() == (w * h) as usize => pixels::mask_outline(sel, w, h),
+                _ => Vec::new(),
+            };
+            self.paint.outline_dirty = false;
+        }
+        let corner = |(x, y): (i32, i32)| view.to_screen(Vec2::new(x as f32 / w as f32, 1.0 - y as f32 / h as f32));
+        for seg in &self.paint.outline {
+            let (a, b) = (corner(seg[0]), corner(seg[1]));
+            if !rect.expand(2.0).intersects(Rect::from_two_pos(a, b)) {
+                continue;
+            }
+            painter.line_segment([a, b], Stroke::new(1.5, Color32::from_black_alpha(220)));
+            painter.extend(egui::Shape::dashed_line(&[a, b], Stroke::new(1.5, Color32::WHITE), 4.0, 4.0));
+        }
+
         // ---- brush outline and readout
         if let Some(p) = resp.hover_pos() {
             let (x, y) = pixel_at(p);
             let tool = if mods.alt { Tool::Picker } else { self.paint.tool };
-            let n = if matches!(tool, Tool::Fill | Tool::Picker) { 1 } else { self.paint.brush as i32 };
+            let n = if matches!(tool, Tool::Fill | Tool::Picker | Tool::Select | Tool::Wand) { 1 } else { self.paint.brush as i32 };
             let off = (n - 1) / 2;
             let r = pixel_rect(x - off, y - off, n);
             painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::BLACK), egui::StrokeKind::Outside);
@@ -403,4 +600,17 @@ impl App {
             painter.text(rect.left_bottom() + egui::vec2(8.0, -8.0), egui::Align2::LEFT_BOTTOM, text, font, Color32::from_gray(210));
         }
     }
+}
+
+fn point_in_polygon(p: Vec2, poly: &[Vec2]) -> bool {
+    let mut inside = false;
+    let mut j = poly.len() - 1;
+    for i in 0..poly.len() {
+        let (a, b) = (poly[i], poly[j]);
+        if (a.y > p.y) != (b.y > p.y) && p.x < (b.x - a.x) * (p.y - a.y) / (b.y - a.y) + a.x {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
 }

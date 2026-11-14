@@ -23,9 +23,11 @@ pub enum Icon {
     New, Load, Save, Export,
     EyeOpen, EyeClosed,
     Pencil, Eraser, Fill, Picker, Line, Rect,
+    // New icons go at the end so the positions in assets/icons.png never shift.
+    Wand,
 }
 
-pub const ALL: [Icon; 44] = [
+pub const ALL: [Icon; 45] = [
     Icon::Object, Icon::Vertex, Icon::Edge, Icon::Face,
     Icon::Click, Icon::BoxSelect, Icon::CircleSelect,
     Icon::Plane, Icon::Cube, Icon::Cylinder, Icon::Cone, Icon::Sphere,
@@ -35,6 +37,7 @@ pub const ALL: [Icon; 44] = [
     Icon::New, Icon::Load, Icon::Save, Icon::Export,
     Icon::EyeOpen, Icon::EyeClosed,
     Icon::Pencil, Icon::Eraser, Icon::Fill, Icon::Picker, Icon::Line, Icon::Rect,
+    Icon::Wand,
 ];
 
 /// A 16x16 scratch canvas with a few drawing helpers.
@@ -89,6 +92,30 @@ impl C {
     }
 }
 
+/// Icons per row in the atlas image (`assets/icons.png`), in the order of [`ALL`].
+pub const ATLAS_COLS: u32 = 11;
+
+pub fn atlas_size() -> (u32, u32) {
+    (ATLAS_COLS * SIZE, (ALL.len() as u32).div_ceil(ATLAS_COLS) * SIZE)
+}
+
+/// Cut one icon out of an atlas image. Returns None if the image is too small to contain it.
+pub fn from_atlas(rgba: &[u8], width: u32, height: u32, icon: Icon) -> Option<Vec<u8>> {
+    let i = ALL.iter().position(|&x| x == icon)? as u32;
+    let (cx, cy) = ((i % ATLAS_COLS) * SIZE, (i / ATLAS_COLS) * SIZE);
+    if cx + SIZE > width || cy + SIZE > height || rgba.len() < (width * height * 4) as usize {
+        return None;
+    }
+    let mut out = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+    for y in cy..cy + SIZE {
+        let row = ((y * width + cx) * 4) as usize;
+        out.extend_from_slice(&rgba[row..row + (SIZE * 4) as usize]);
+    }
+    Some(out)
+}
+
+/// The built-in drawing of an icon: used to generate the default atlas, and as a
+/// fallback for icons the atlas image does not contain.
 pub fn pixels(icon: Icon) -> Vec<u8> {
     let mut c = C::new();
     match icon {
@@ -382,6 +409,17 @@ pub fn pixels(icon: Icon) -> Vec<u8> {
             c.f(2, 11, 4, 13, O);
             c.f(11, 2, 13, 4, O);
         }
+        Icon::Wand => {
+            for i in 0..8 {
+                c.p(2 + i, 13 - i, W);
+                c.p(3 + i, 13 - i, G);
+            }
+            // Sparkle at the tip.
+            c.l(12, 0, 12, 6, O);
+            c.l(9, 3, 15, 3, O);
+            c.pts(&[(10, 1), (14, 1), (10, 5), (14, 5)], O);
+            c.p(12, 3, W);
+        }
         Icon::Rect => {
             c.r(2, 4, 13, 11, W);
             c.f(1, 3, 3, 5, O);
@@ -389,4 +427,30 @@ pub fn pixels(icon: Icon) -> Vec<u8> {
         }
     }
     c.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atlas_round_trip() {
+        let (w, h) = atlas_size();
+        let mut atlas = vec![0u8; (w * h * 4) as usize];
+        for (i, &icon) in ALL.iter().enumerate() {
+            let (cx, cy) = ((i as u32 % ATLAS_COLS) * SIZE, (i as u32 / ATLAS_COLS) * SIZE);
+            let px = pixels(icon);
+            for y in 0..SIZE {
+                let dst = (((cy + y) * w + cx) * 4) as usize;
+                let src = (y * SIZE * 4) as usize;
+                atlas[dst..dst + (SIZE * 4) as usize].copy_from_slice(&px[src..src + (SIZE * 4) as usize]);
+            }
+        }
+        for &icon in &ALL {
+            assert_eq!(from_atlas(&atlas, w, h, icon).unwrap(), pixels(icon), "{icon:?}");
+        }
+        // An older, shorter atlas simply lacks the newest icons.
+        assert!(from_atlas(&atlas, w, SIZE, Icon::Wand).is_none());
+        assert!(from_atlas(&atlas, w, SIZE, Icon::Object).is_some());
+    }
 }

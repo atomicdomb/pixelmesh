@@ -212,11 +212,19 @@ impl App {
             redo: Vec::new(),
             left_tab: LeftTab::Uv,
             paint: crate::paint::Paint::default(),
-            icons: pixelmesh::icons::ALL.iter().map(|&icon| {
-                let size = pixelmesh::icons::SIZE as usize;
-                let img = egui::ColorImage::from_rgba_unmultiplied([size, size], &pixelmesh::icons::pixels(icon));
-                (icon, cc.egui_ctx.load_texture(format!("icon-{icon:?}"), img, egui::TextureOptions::NEAREST))
-            }).collect(),
+            icons: {
+                // Icons come from assets/icons.png (compiled into the program); anything
+                // that image does not contain falls back to the built-in drawing.
+                let atlas = image::load_from_memory(include_bytes!("../assets/icons.png")).ok().map(|i| i.to_rgba8());
+                pixelmesh::icons::ALL.iter().map(|&icon| {
+                    let size = pixelmesh::icons::SIZE as usize;
+                    let px = atlas.as_ref()
+                        .and_then(|a| pixelmesh::icons::from_atlas(a.as_raw(), a.width(), a.height(), icon))
+                        .unwrap_or_else(|| pixelmesh::icons::pixels(icon));
+                    let img = egui::ColorImage::from_rgba_unmultiplied([size, size], &px);
+                    (icon, cc.egui_ctx.load_texture(format!("icon-{icon:?}"), img, egui::TextureOptions::NEAREST))
+                }).collect()
+            },
             camera: Camera::default(),
             renderer,
             modal: None,
