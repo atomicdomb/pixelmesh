@@ -7,7 +7,7 @@ use crate::viewport::Modal;
 use eframe::egui::{self, Key};
 use glam::{Vec2, Vec3};
 use pixelmesh::fbx;
-use pixelmesh::mesh::{Mesh, UvOp};
+use pixelmesh::mesh::Mesh;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -19,7 +19,15 @@ pub enum SelMode {
     /// Whole objects: click picks an object, transforms move all of it.
     Object,
     Vertex,
+    Edge,
     Face,
+}
+
+/// An edge as its two vertex indices, smaller first.
+pub type Edge = (u32, u32);
+
+pub fn edge_key(a: u32, b: u32) -> Edge {
+    (a.min(b), a.max(b))
 }
 
 /// How left-click / left-drag selects in the viewport.
@@ -39,6 +47,34 @@ pub struct Object {
     pub mesh: Mesh,
     #[serde(default = "yes")]
     pub visible: bool,
+    /// The object's pivot (world space). Object-mode rotation and scaling turn about it,
+    /// and it becomes the model's position in exported FBX files.
+    #[serde(default)]
+    pub origin: Vec3,
+    /// Orientation as XYZ Euler angles in degrees. The vertices are stored already
+    /// rotated; this records by how much, so it can be shown, edited and exported.
+    #[serde(default)]
+    pub rotation: Vec3,
+}
+
+impl Object {
+    pub fn new(name: impl Into<String>, mesh: Mesh) -> Self {
+        Object { name: name.into(), mesh, visible: true, origin: Vec3::ZERO, rotation: Vec3::ZERO }
+    }
+
+    pub fn bounds(&self) -> Option<(Vec3, Vec3)> {
+        let first = *self.mesh.positions.first()?;
+        Some(self.mesh.positions.iter().fold((first, first), |(lo, hi), p| (lo.min(*p), hi.max(*p))))
+    }
+}
+
+/// Where "set origin" puts an object's pivot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OriginTo {
+    Centre,
+    Base,
+    World,
+    Selection,
 }
 
 fn yes() -> bool {
@@ -49,6 +85,7 @@ pub struct Snapshot {
     objects: Vec<Object>,
     active: usize,
     sel_objects: BTreeSet<usize>,
+    sel_edges: BTreeSet<Edge>,
     sel_verts: BTreeSet<u32>,
     sel_faces: BTreeSet<usize>,
 }
@@ -112,11 +149,14 @@ pub struct App {
     pub sel_mode: SelMode,
     last_edit_mode: SelMode,
     pub sel_verts: BTreeSet<u32>,
+    pub sel_edges: BTreeSet<Edge>,
     pub sel_faces: BTreeSet<usize>,
     undo: Vec<UndoStep>,
     redo: Vec<UndoStep>,
     pub left_tab: LeftTab,
     pub paint: crate::paint::Paint,
+    /// Interface icons, uploaded once at start-up.
+    pub icons: std::collections::HashMap<pixelmesh::icons::Icon, egui::TextureHandle>,
 
     pub camera: Camera,
     pub renderer: Option<Arc<Mutex<Renderer>>>,
@@ -128,13 +168,15 @@ pub struct App {
     tex_counter: u64,
     last_mtime_check: f64,
 
+    /// Object mode: moving affects only the origin, not the geometry.
+    pub origin_only: bool,
     pub snap_on: bool,
     pub grid_snap: f32,
     pub show_uv: bool,
     pub show_gizmo: bool,
     pub px_per_unit: f32,
-    segments: u32,
-    embed_texture: bool,
+    pub segments: u32,
+    pub embed_texture: bool,
     project_path: Option<PathBuf>,
     pub status: String,
 }
@@ -149,8 +191,9 @@ impl App {
             }
             None => None,
         };
+        crate::sidebar::apply_theme(&cc.egui_ctx);
         let mut app = App {
-            objects: vec![Object { name: "Cube".into(), mesh: Mesh::cube(), visible: true }],
+            objects: vec![Object::new("Cube", Mesh::cube())],
             active: 0,
             sel_objects: [0].into(),
             select_tool: SelectTool::Click,
@@ -163,11 +206,17 @@ impl App {
             sel_mode: SelMode::Object,
             last_edit_mode: SelMode::Face,
             sel_verts: BTreeSet::new(),
+            sel_edges: BTreeSet::new(),
             sel_faces: BTreeSet::new(),
             undo: Vec::new(),
             redo: Vec::new(),
             left_tab: LeftTab::Uv,
             paint: crate::paint::Paint::default(),
+            icons: pixelmesh::icons::ALL.iter().map(|&icon| {
+                let size = pixelmesh::icons::SIZE as usize;
+                let img = egui::ColorImage::from_rgba_unmultiplied([size, size], &pixelmesh::icons::pixels(icon));
+                (icon, cc.egui_ctx.load_texture(format!("icon-{icon:?}"), img, egui::TextureOptions::NEAREST))
+            }).collect(),
             camera: Camera::default(),
             renderer,
             modal: None,
@@ -176,6 +225,7 @@ impl App {
             texture: None,
             tex_counter: 0,
             last_mtime_check: 0.0,
+            origin_only: false,
             snap_on: false,
             grid_snap: 0.25,
             show_uv: true,
@@ -254,12 +304,56 @@ impl App {
     /// (object, vertex) pairs the transform tools act on.
     pub fn transform_targets(&self) -> Vec<(usize, u32)> {
         match self.sel_mode {
+            SelMode::Object if self.origin_only => Vec::new(),
             SelMode::Object => self.sel_objects.iter()
                 .filter(|&&i| self.objects.get(i).is_some_and(|o| o.visible))
                 .flat_map(|&i| (0..self.objects[i].mesh.positions.len() as u32).map(move |v| (i, v)))
                 .collect(),
             _ => self.active_verts().into_iter().map(|v| (self.active, v)).collect(),
         }
+    }
+
+    /// Selected, visible objects (object mode only): the ones whose origin follows a transform.
+    pub fn transform_objects(&self) -> Vec<usize> {
+        if self.sel_mode != SelMode::Object {
+            return Vec::new();
+        }
+        self.sel_objects.iter().copied().filter(|&i| self.objects.get(i).is_some_and(|o| o.visible)).collect()
+    }
+
+    /// Move the origin of the selected objects (object mode) or the edited object without touching the geometry.
+    pub fn set_origin(&mut self, to: OriginTo) {
+        let targets: Vec<usize> = if self.sel_mode == SelMode::Object {
+            self.sel_objects.iter().copied().collect()
+        } else if self.active < self.objects.len() {
+            vec![self.active]
+        } else {
+            Vec::new()
+        };
+        let selection = self.active_verts();
+        let mut moves = Vec::new();
+        for i in targets {
+            let obj = &self.objects[i];
+            let target = match to {
+                OriginTo::World => Some(Vec3::ZERO),
+                OriginTo::Centre => obj.bounds().map(|(lo, hi)| (lo + hi) * 0.5),
+                OriginTo::Base => obj.bounds().map(|(lo, hi)| Vec3::new((lo.x + hi.x) * 0.5, lo.y, (lo.z + hi.z) * 0.5)),
+                OriginTo::Selection if i == self.active && !selection.is_empty() => {
+                    Some(selection.iter().map(|&v| obj.mesh.positions[v as usize]).sum::<Vec3>() / selection.len() as f32)
+                }
+                OriginTo::Selection => None,
+            };
+            moves.extend(target.map(|t| (i, t)));
+        }
+        if moves.is_empty() {
+            self.status = "Nothing to set the origin from.".into();
+            return;
+        }
+        self.push_undo();
+        for (i, t) in moves {
+            self.objects[i].origin = t;
+        }
+        self.status = "Origin moved (geometry unchanged).".into();
     }
 
     /// Join every selected object into the active one.
@@ -285,7 +379,7 @@ impl App {
         self.status = format!("Merged {} objects into \"{}\"", others.len() + 1, self.objects[target].name);
     }
 
-    fn unique_name(&self, base: &str) -> String {
+    pub fn unique_name(&self, base: &str) -> String {
         let taken = |n: &str| self.objects.iter().any(|o| o.name == n);
         if !taken(base) {
             return base.to_string();
@@ -300,26 +394,49 @@ impl App {
         match self.sel_mode {
             SelMode::Object => (0..self.mesh().positions.len() as u32).collect(),
             SelMode::Vertex => self.sel_verts.clone(),
+            SelMode::Edge => self.sel_edges.iter().flat_map(|&(a, b)| [a, b]).collect(),
             SelMode::Face => self.mesh().verts_of_faces(&self.sel_faces),
         }
     }
 
-    /// Faces the face / UV tools act on. In vertex mode: faces whose corners are all selected.
+    fn face_edges(&self, f: usize) -> Vec<Edge> {
+        let v = &self.mesh().faces[f].verts;
+        (0..v.len()).map(|i| edge_key(v[i], v[(i + 1) % v.len()])).collect()
+    }
+
+    /// Faces the face / UV tools act on. In vertex mode: faces whose corners are all
+    /// selected; in edge mode: faces whose edges are all selected.
     pub fn active_faces(&self) -> BTreeSet<usize> {
+        let count = self.mesh().faces.len();
         match self.sel_mode {
-            SelMode::Object => (0..self.mesh().faces.len()).collect(),
+            SelMode::Object => (0..count).collect(),
             SelMode::Face => self.sel_faces.clone(),
-            SelMode::Vertex => (0..self.mesh().faces.len())
+            SelMode::Vertex => (0..count)
                 .filter(|&f| self.mesh().faces[f].verts.iter().all(|v| self.sel_verts.contains(v)))
+                .collect(),
+            SelMode::Edge => (0..count)
+                .filter(|&f| self.face_edges(f).iter().all(|e| self.sel_edges.contains(e)))
                 .collect(),
         }
     }
 
+    /// Select these faces in whatever edit mode is current (their vertices / edges in those modes).
+    pub fn select_faces(&mut self, faces: BTreeSet<usize>) {
+        self.sel_verts = self.mesh().verts_of_faces(&faces);
+        self.sel_edges = faces.iter().flat_map(|&f| self.face_edges(f)).collect();
+        self.sel_faces = faces;
+    }
+
     pub fn set_mode(&mut self, mode: SelMode) {
-        // Carry the selection over so switching between vertex and face mode does not lose it.
+        // Carry the selection over so switching between edit modes does not lose it.
         match (self.sel_mode, mode) {
             (SelMode::Face, SelMode::Vertex) => self.sel_verts = self.mesh().verts_of_faces(&self.sel_faces),
-            (SelMode::Vertex, SelMode::Face) => self.sel_faces = self.active_faces(),
+            (SelMode::Face, SelMode::Edge) => self.sel_edges = self.sel_faces.iter().flat_map(|&f| self.face_edges(f)).collect(),
+            (SelMode::Edge, SelMode::Vertex) => self.sel_verts = self.active_verts(),
+            (SelMode::Vertex, SelMode::Edge) => {
+                self.sel_edges = self.mesh().edges().into_iter().filter(|(a, b)| self.sel_verts.contains(a) && self.sel_verts.contains(b)).collect()
+            }
+            (SelMode::Vertex | SelMode::Edge, SelMode::Face) => self.sel_faces = self.active_faces(),
             _ => {}
         }
         if mode != SelMode::Object {
@@ -344,11 +461,13 @@ impl App {
             return;
         }
         self.sel_verts = (0..self.mesh().positions.len() as u32).collect();
+        self.sel_edges = self.mesh().edges().into_iter().collect();
         self.sel_faces = (0..self.mesh().faces.len()).collect();
     }
 
     pub fn clear_selection(&mut self) {
         self.sel_verts.clear();
+        self.sel_edges.clear();
         self.sel_faces.clear();
         self.uv.sel.clear();
     }
@@ -367,19 +486,19 @@ impl App {
         let seed: BTreeSet<usize> = match self.sel_mode {
             SelMode::Object => return,
             SelMode::Face => self.sel_faces.clone(),
-            SelMode::Vertex => (0..mesh.faces.len())
-                .filter(|&f| mesh.faces[f].verts.iter().any(|v| self.sel_verts.contains(v)))
-                .collect(),
+            SelMode::Vertex | SelMode::Edge => {
+                let verts = self.active_verts();
+                (0..mesh.faces.len()).filter(|&f| mesh.faces[f].verts.iter().any(|v| verts.contains(v))).collect()
+            }
         };
         let faces = mesh.linked_faces(&seed);
-        self.sel_verts = mesh.verts_of_faces(&faces);
-        self.sel_faces = faces;
+        self.select_faces(faces);
     }
 
     // ----------------------------------------------------------------- undo
 
     fn snapshot(&self) -> Snapshot {
-        Snapshot { objects: self.objects.clone(), active: self.active, sel_objects: self.sel_objects.clone(), sel_verts: self.sel_verts.clone(), sel_faces: self.sel_faces.clone() }
+        Snapshot { objects: self.objects.clone(), active: self.active, sel_objects: self.sel_objects.clone(), sel_edges: self.sel_edges.clone(), sel_verts: self.sel_verts.clone(), sel_faces: self.sel_faces.clone() }
     }
 
     fn restore(&mut self, s: Snapshot) {
@@ -389,6 +508,7 @@ impl App {
         // UV selections refer to corners of the mesh as it was; do not carry them across an undo.
         self.uv.sel.clear();
         self.sel_verts = s.sel_verts;
+        self.sel_edges = s.sel_edges;
         self.sel_faces = s.sel_faces;
     }
 
@@ -456,11 +576,11 @@ impl App {
 
     /// In object mode (or an empty scene) a primitive becomes a new object;
     /// in vertex / face mode it is added to the object being edited.
-    fn add_primitive(&mut self, name: &str, prim: Mesh) {
+    pub fn add_primitive(&mut self, name: &str, prim: Mesh) {
         self.push_undo();
         if self.sel_mode == SelMode::Object || self.objects.is_empty() {
             let name = self.unique_name(name);
-            self.objects.push(Object { name, mesh: prim, visible: true });
+            self.objects.push(Object::new(name, prim));
             self.active = self.objects.len() - 1;
             self.sel_objects = [self.active].into();
             self.clear_selection();
@@ -498,6 +618,14 @@ impl App {
                 let verts = self.sel_verts.clone();
                 self.mesh_mut().delete_verts(&verts);
             }
+            SelMode::Edge if !self.sel_edges.is_empty() => {
+                // Deleting an edge takes the faces on either side of it with it.
+                let faces: BTreeSet<usize> = (0..self.mesh().faces.len())
+                    .filter(|&f| self.face_edges(f).iter().any(|e| self.sel_edges.contains(e)))
+                    .collect();
+                self.push_undo();
+                self.mesh_mut().delete_faces(&faces);
+            }
             _ => return,
         }
         self.clear_selection();
@@ -527,8 +655,7 @@ impl App {
         }
         self.push_undo();
         let new_faces = self.mesh_mut().duplicate_faces(&faces);
-        self.sel_verts = self.mesh().verts_of_faces(&new_faces);
-        self.sel_faces = new_faces;
+        self.select_faces(new_faces);
         true
     }
 
@@ -539,7 +666,7 @@ impl App {
         }
     }
 
-    fn uv_op(&mut self, f: impl FnOnce(&mut Mesh, &BTreeSet<usize>)) {
+    pub fn uv_op(&mut self, f: impl FnOnce(&mut Mesh, &BTreeSet<usize>)) {
         let faces = self.active_faces();
         if faces.is_empty() {
             self.status = "Select one or more faces first.".into();
@@ -685,7 +812,7 @@ impl App {
         let first_new = self.objects.len();
         for obj in imported.objects {
             let name = self.unique_name(&obj.name);
-            self.objects.push(Object { name, mesh: obj.mesh, visible: true });
+            self.objects.push(Object { origin: obj.origin, rotation: obj.rotation, ..Object::new(name, obj.mesh) });
         }
         let count = self.objects.len() - first_new;
         self.sel_mode = SelMode::Object;
@@ -764,7 +891,7 @@ impl App {
         match result {
             Ok(mut file) => {
                 if let Some(mesh) = file.mesh.take() {
-                    file.objects.push(Object { name: "Object".into(), mesh, visible: true });
+                    file.objects.push(Object::new("Object", mesh));
                 }
                 let valid = file.objects.iter().all(|o| {
                     o.mesh.faces.iter().all(|f| {
@@ -814,7 +941,7 @@ impl App {
         // Objects without faces would only produce empty nodes.
         let objects: Vec<fbx::FbxObject> = self.objects.iter()
             .filter(|o| !o.mesh.faces.is_empty())
-            .map(|o| fbx::FbxObject { name: &o.name, mesh: &o.mesh })
+            .map(|o| fbx::FbxObject { name: &o.name, mesh: &o.mesh, origin: o.origin, rotation: o.rotation })
             .collect();
         if objects.is_empty() {
             self.status = "Nothing to export: the scene has no faces.".into();
@@ -943,13 +1070,13 @@ impl App {
         }
     }
 
-    fn pick_texture(&mut self, ctx: &egui::Context) {
+    pub fn pick_texture(&mut self, ctx: &egui::Context) {
         if let Some(p) = rfd::FileDialog::new().add_filter("Image", &["png", "jpg", "jpeg", "bmp", "tga"]).pick_file() {
             self.load_texture(ctx, &p);
         }
     }
 
-    fn pick_export(&mut self) {
+    pub fn pick_export(&mut self) {
         let default = self.project_path.as_ref().and_then(|p| p.file_stem()).and_then(|s| s.to_str()).unwrap_or("model").to_string();
         if let Some(p) = rfd::FileDialog::new().add_filter("FBX", &["fbx"]).set_file_name(format!("{default}.fbx")).save_file() {
             self.export_fbx(&p);
@@ -968,270 +1095,30 @@ impl App {
         self.camera.distance = ((hi - lo).length() * 1.6).max(1.0);
     }
 
-    /// The scene outliner: every object with a visibility box; click a name to select it.
-    fn object_list(&mut self, ui: &mut egui::Ui) {
-        ui.strong("Objects");
-        if self.objects.is_empty() {
-            ui.weak("Empty scene. Add a mesh below.");
-            return;
-        }
-        let object_mode = self.sel_mode == SelMode::Object;
-        let mut clicked = None;
-        for (i, obj) in self.objects.iter_mut().enumerate() {
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut obj.visible, "").on_hover_text("Visible");
-                let mut label = egui::RichText::new(format!("{}  ({} faces)", obj.name, obj.mesh.faces.len()));
-                if i == self.active {
-                    label = label.strong();
-                }
-                // In edit modes only the object being edited is highlighted.
-                let selected = if object_mode { self.sel_objects.contains(&i) } else { i == self.active };
-                let r = ui.selectable_label(selected, label);
-                if r.clicked() {
-                    clicked = Some((i, ui.input(|inp| inp.modifiers.shift || inp.modifiers.command)));
-                }
-            });
-        }
-        if let Some((i, toggle)) = clicked {
-            self.set_mode(SelMode::Object);
-            self.select_object(i, toggle);
-        }
-        ui.weak("Shift+click to select several");
-        let active = self.active;
-        if let Some(obj) = self.objects.get_mut(active) {
-            ui.horizontal(|ui| {
-                ui.label("Name");
-                ui.add(egui::TextEdit::singleline(&mut obj.name).desired_width(150.0));
-            });
-        }
-        ui.horizontal(|ui| {
-            if ui.button("Duplicate").clicked() {
-                self.set_mode(SelMode::Object);
-                if self.duplicate_selection() {
-                    self.start_modal_no_undo(crate::viewport::ModalKind::Grab, None);
-                }
-            }
-            if ui.button("Delete").clicked() {
-                self.set_mode(SelMode::Object);
-                self.delete_selection();
-            }
-            let can_merge = object_mode && self.sel_objects.len() >= 2;
-            if ui.add_enabled(can_merge, egui::Button::new("Merge"))
-                .on_hover_text("Join the selected objects into the active (bold) one  ·  Ctrl+J")
-                .on_disabled_hover_text("Select two or more objects first (Shift+click)")
-                .clicked()
-            {
-                self.merge_selected();
-            }
-        });
-    }
-
-    fn tool_panel(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            ui.add_space(4.0);
-            self.object_list(ui);
-
-            ui.separator();
-            ui.strong("Mode");
-            ui.horizontal(|ui| {
-                let mut mode = self.sel_mode;
-                ui.selectable_value(&mut mode, SelMode::Object, "Object (O)");
-                ui.selectable_value(&mut mode, SelMode::Vertex, "Vertex (V)");
-                ui.selectable_value(&mut mode, SelMode::Face, "Face (F)");
-                if mode != self.sel_mode {
-                    self.set_mode(mode);
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.select_tool, SelectTool::Click, "Click (Q)");
-                ui.selectable_value(&mut self.select_tool, SelectTool::Box, "Box (B)");
-                ui.selectable_value(&mut self.select_tool, SelectTool::Circle, "Circle (C)");
-            });
-            if self.select_tool == SelectTool::Circle {
-                ui.horizontal(|ui| {
-                    ui.label("Circle radius");
-                    ui.add(egui::DragValue::new(&mut self.circle_radius).range(5.0..=300.0).suffix(" px"))
-                        .on_hover_text("Also [ and ] in the viewport");
-                });
-            }
-            if self.select_tool != SelectTool::Click {
-                ui.checkbox(&mut self.only_visible, "Only visible")
-                    .on_hover_text("Box / circle skip vertices and faces hidden behind geometry. Untick to select straight through.");
-                ui.weak("Drag selects · Shift adds · Ctrl removes");
-            }
-            ui.horizontal(|ui| {
-                if ui.button("All (A)").clicked() {
-                    self.select_all();
-                }
-                if ui.button("None").clicked() {
-                    self.deselect_all();
-                }
-                if ui.button("Linked (L)").clicked() {
-                    self.select_linked();
-                }
-            });
-
-            ui.separator();
-            ui.strong("Add mesh");
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Plane").clicked() {
-                    self.add_primitive("Plane", Mesh::plane());
-                }
-                if ui.button("Cube").clicked() {
-                    self.add_primitive("Cube", Mesh::cube());
-                }
-                if ui.button("Cylinder").clicked() {
-                    self.add_primitive("Cylinder", Mesh::cylinder(self.segments, 0.5, 0.5, 1.0));
-                }
-                if ui.button("Cone").clicked() {
-                    self.add_primitive("Cone", Mesh::cylinder(self.segments, 0.5, 0.0, 1.0));
-                }
-                if ui.button("Sphere").clicked() {
-                    self.add_primitive("Sphere", Mesh::sphere(self.segments, (self.segments / 2).max(3), 0.5));
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Segments");
-                ui.add(egui::DragValue::new(&mut self.segments).range(3..=64));
-            });
-
-            ui.separator();
-            ui.strong("Transform");
-            ui.horizontal(|ui| {
-                if ui.button("Move (G)").clicked() {
-                    self.start_modal(crate::viewport::ModalKind::Grab, None);
-                }
-                if ui.button("Rotate (R)").clicked() {
-                    self.start_modal(crate::viewport::ModalKind::Rotate, None);
-                }
-                if ui.button("Scale (S)").clicked() {
-                    self.start_modal(crate::viewport::ModalKind::Scale, None);
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.snap_on, "Snap every")
-                    .on_hover_text("Moves jump in steps of this distance. Holding Ctrl flips this setting while you drag.");
-                ui.add(egui::DragValue::new(&mut self.grid_snap).speed(0.0125).range(0.001..=10.0).max_decimals(4));
-            });
-            self.position_fields(ui);
-
-            ui.separator();
-            ui.strong("Mesh");
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Extrude (E)").clicked() {
-                    self.extrude();
-                }
-                if ui.button("Inset (I)").on_hover_text("Shrink the selected faces inwards, leaving a rim").clicked() {
-                    self.start_inset();
-                }
-                if ui.button("Bevel (Ctrl+B)").on_hover_text("Chamfer the edges of the selected faces (or between selected vertices)").clicked() {
-                    self.start_bevel();
-                }
-                if ui.button("Loop cut (Ctrl+R)").on_hover_text("Cut a ring of faces in two; hover an edge to choose where").clicked() {
-                    self.start_loop_cut();
-                }
-                if ui.button("Duplicate (Shift+D)").clicked() && self.duplicate_selection() {
-                    self.start_modal(crate::viewport::ModalKind::Grab, None);
-                }
-                if ui.button("Delete (X)").clicked() {
-                    self.delete_selection();
-                }
-                if ui.button("Flip normals").clicked() {
-                    let faces = self.active_faces();
-                    if !faces.is_empty() {
-                        self.push_undo();
-                        self.mesh_mut().flip_faces(&faces);
-                    }
-                }
-                if ui.button("Merge overlapping verts").clicked() {
-                    self.push_undo();
-                    let n = self.mesh_mut().merge_by_distance(1e-4);
-                    self.clear_selection();
-                    self.status = format!("Merged {n} vertices");
-                }
-            });
-
-            ui.separator();
-            ui.strong("UV mapping");
-            let tex = self.tex_size();
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Fit each face").on_hover_text("Stretch every selected face over the whole texture").clicked() {
-                    self.uv_op(|m, f| m.uv_fit_each(f));
-                }
-                if ui.button("Box project").on_hover_text("Project along the nearest axis at the texel density below").clicked() {
-                    let ppu = self.px_per_unit;
-                    self.uv_op(|m, f| m.uv_box_project(f, ppu, tex));
-                }
-                if ui.button("Project from view").clicked() {
-                    let view = self.camera.view();
-                    self.uv_op(|m, f| m.uv_project_view(f, view));
-                }
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Rotate 90°").clicked() {
-                    self.uv_op(|m, f| m.uv_transform(f, UvOp::Rotate90));
-                }
-                if ui.button("Flip U").clicked() {
-                    self.uv_op(|m, f| m.uv_transform(f, UvOp::FlipU));
-                }
-                if ui.button("Flip V").clicked() {
-                    self.uv_op(|m, f| m.uv_transform(f, UvOp::FlipV));
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Pixels per unit");
-                ui.add(egui::DragValue::new(&mut self.px_per_unit).speed(0.25).range(1.0..=512.0));
-            });
-            ui.checkbox(&mut self.uv.show_all, "Show unselected faces");
-
-            ui.separator();
-            ui.strong("Texture");
-            ui.horizontal(|ui| {
-                if ui.button("New…").clicked() {
-                    self.show_uv = true;
-                    self.left_tab = LeftTab::Paint;
-                    self.paint.open_new_dialog(self.texture.as_ref().map(|t| t.size));
-                }
-                if ui.button("Load…").clicked() {
-                    self.pick_texture(&ctx);
-                }
-                if self.texture.is_some() && ui.button("Remove").clicked() {
-                    self.texture = None;
-                }
-            });
-            match &self.texture {
-                Some(t) => {
-                    let name = t.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    ui.label(format!("{name}{}  {}×{}", if t.dirty { " *" } else { "" }, t.size[0], t.size[1]));
-                    ui.weak(if t.dirty { "Unsaved paint changes (Ctrl+S)." } else { "Reloads automatically when the file changes." });
-                }
-                None => {
-                    ui.weak("No texture (64×64 grid assumed).");
-                }
-            }
-
-            ui.separator();
-            if ui.button("Export FBX…").clicked() {
-                self.pick_export();
-            }
-            ui.add_space(6.0);
-            ui.weak(format!("{} objects · {} verts · {} faces", self.objects.len(),
-                self.objects.iter().map(|o| o.mesh.positions.len()).sum::<usize>(),
-                self.objects.iter().map(|o| o.mesh.faces.len()).sum::<usize>()));
-        });
-    }
-
     /// X/Y/Z fields for the centre of the selection; editing them moves it.
-    fn position_fields(&mut self, ui: &mut egui::Ui) {
+    pub fn position_fields(&mut self, ui: &mut egui::Ui) {
+        let object_mode = self.sel_mode == SelMode::Object;
         let targets = self.transform_targets();
-        if targets.is_empty() {
+        let objs = self.transform_objects();
+        // What the numbers show: an object's origin, or the middle of the selected geometry.
+        let centre = if objs.len() == 1 {
+            self.objects[objs[0]].origin
+        } else if !objs.is_empty() && self.origin_only {
+            objs.iter().map(|&i| self.objects[i].origin).sum::<Vec3>() / objs.len() as f32
+        } else if !targets.is_empty() {
+            targets.iter().map(|&(o, v)| self.objects[o].mesh.positions[v as usize]).sum::<Vec3>() / targets.len() as f32
+        } else {
             return;
-        }
-        let centre = targets.iter().map(|&(o, v)| self.objects[o].mesh.positions[v as usize]).sum::<Vec3>() / targets.len() as f32;
+        };
+        let muted = egui::Color32::from_rgb(138, 144, 156);
         let mut edited = centre;
         ui.horizontal(|ui| {
-            ui.label("Pos");
+            let label = if object_mode && self.origin_only { "Origin" } else { "Pos" };
+            ui.label(egui::RichText::new(label).color(muted)).on_hover_text(if object_mode {
+                "Position of the object's origin"
+            } else {
+                "Middle of the selection"
+            });
             for (axis, label) in ["X ", "Y ", "Z "].into_iter().enumerate() {
                 let r = ui.add(egui::DragValue::new(&mut edited[axis]).speed(0.01).prefix(label).max_decimals(3));
                 if r.drag_started() || r.gained_focus() {
@@ -1244,6 +1131,37 @@ impl App {
             for (o, v) in targets {
                 self.objects[o].mesh.positions[v as usize] += delta;
             }
+            for &i in &objs {
+                self.objects[i].origin += delta;
+            }
+        }
+
+        // Rotation of the active object, about its origin.
+        if !(object_mode && self.sel_objects.contains(&self.active) && self.active < self.objects.len()) {
+            return;
+        }
+        let old = self.objects[self.active].rotation;
+        let mut new = old;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Rot").color(muted)).on_hover_text("Rotation of the active object about its origin, in degrees (applied X, then Y, then Z)");
+            for (axis, label) in ["X ", "Y ", "Z "].into_iter().enumerate() {
+                let r = ui.add(egui::DragValue::new(&mut new[axis]).speed(1.0).prefix(label).suffix("°").max_decimals(2));
+                if r.drag_started() || r.gained_focus() {
+                    self.push_undo();
+                }
+            }
+        });
+        if new != old {
+            let turn = pixelmesh::xform::euler_quat(new) * pixelmesh::xform::euler_quat(old).inverse();
+            let origin_only = self.origin_only;
+            let obj = &mut self.objects[self.active];
+            // With "origin only" on, just the recorded orientation changes; the geometry stays put.
+            if !origin_only {
+                for p in &mut obj.mesh.positions {
+                    *p = obj.origin + turn * (*p - obj.origin);
+                }
+            }
+            obj.rotation = new;
         }
     }
 
@@ -1259,8 +1177,7 @@ impl App {
         }
         self.push_undo();
         let normal = self.mesh_mut().extrude_faces(&faces);
-        self.sel_verts = self.mesh().verts_of_faces(&faces);
-        self.sel_faces = faces;
+        self.select_faces(faces);
         // The undo step already exists, so the modal must not add another one.
         self.start_modal_no_undo(crate::viewport::ModalKind::Grab, Some(normal));
     }
@@ -1291,6 +1208,7 @@ impl App {
                 let v = &mesh.faces[f].verts;
                 (0..v.len()).map(|i| (v[i].min(v[(i + 1) % v.len()]), v[i].max(v[(i + 1) % v.len()]))).collect::<Vec<_>>()
             }).collect(),
+            SelMode::Edge => self.sel_edges.clone(),
             // Vertex mode: every edge with both ends selected.
             SelMode::Vertex => mesh.edges().into_iter()
                 .filter(|(a, b)| self.sel_verts.contains(a) && self.sel_verts.contains(b))
@@ -1302,6 +1220,95 @@ impl App {
         }
         self.push_undo();
         self.op = Some(crate::viewport::OpModal::new(crate::viewport::OpKind::Bevel, self.mesh().clone(), BTreeSet::new(), edges));
+    }
+
+    /// Join the selected faces into single polygons (one per connected group).
+    pub fn merge_selected_faces(&mut self) {
+        if self.sel_mode == SelMode::Object {
+            self.status = "Merge faces works in an edit mode: press Tab, select two or more adjoining faces.".into();
+            return;
+        }
+        let faces = self.active_faces();
+        if faces.len() < 2 {
+            self.status = "Merge faces needs two or more adjoining faces selected.".into();
+            return;
+        }
+        self.push_undo();
+        let (new, skipped) = self.mesh_mut().merge_faces(&faces);
+        if new.is_empty() {
+            self.revert_last();
+            self.status = if skipped > 0 {
+                "Could not merge: the selection's outline is not a single loop (it has a hole or only touches at a point).".into()
+            } else {
+                "Nothing to merge: the selected faces do not share an edge.".into()
+            };
+            return;
+        }
+        let count = new.len();
+        self.select_faces(new);
+        self.status = format!("Merged into {count} face(s){}", if skipped > 0 { format!(", {skipped} group(s) skipped") } else { String::new() });
+    }
+
+    /// Right-click menu of the 3D view.
+    pub fn context_menu(&mut self, ui: &mut egui::Ui) {
+        use crate::viewport::ModalKind;
+        ui.set_min_width(170.0);
+        if self.sel_mode == SelMode::Object {
+            let n = self.sel_objects.len();
+            if ui.add_enabled(n > 0, egui::Button::new("Edit faces   Tab")).clicked() {
+                self.toggle_edit_mode();
+            }
+            ui.separator();
+            if ui.add_enabled(n > 0, egui::Button::new("Duplicate   Shift+D")).clicked() && self.duplicate_selection() {
+                self.start_modal_no_undo(ModalKind::Grab, None);
+            }
+            if ui.add_enabled(n >= 2, egui::Button::new("Merge objects   Ctrl+J")).clicked() {
+                self.merge_selected();
+            }
+            ui.separator();
+            if ui.add_enabled(n > 0, egui::Button::new(if n > 1 { "Delete objects   X" } else { "Delete object   X" })).clicked() {
+                self.delete_selection();
+            }
+            return;
+        }
+        let faces = self.active_faces().len();
+        let any = !self.active_verts().is_empty();
+        let delete_label = match self.sel_mode {
+            SelMode::Vertex => "Delete vertices   X",
+            SelMode::Edge => "Delete edges   X",
+            _ => "Delete faces   X",
+        };
+        if ui.add_enabled(any, egui::Button::new(delete_label)).clicked() {
+            self.delete_selection();
+        }
+        if ui.add_enabled(faces >= 2, egui::Button::new("Merge faces   M")).clicked() {
+            self.merge_selected_faces();
+        }
+        ui.separator();
+        if ui.add_enabled(faces > 0, egui::Button::new("Extrude   E")).clicked() {
+            self.extrude();
+        }
+        if ui.add_enabled(faces > 0, egui::Button::new("Inset   I")).clicked() {
+            self.start_inset();
+        }
+        if ui.add_enabled(any, egui::Button::new("Bevel   Ctrl+B")).clicked() {
+            self.start_bevel();
+        }
+        if ui.button("Loop cut   Ctrl+R").clicked() {
+            self.start_loop_cut();
+        }
+        ui.separator();
+        if ui.add_enabled(faces > 0, egui::Button::new("Duplicate   Shift+D")).clicked() && self.duplicate_selection() {
+            self.start_modal_no_undo(ModalKind::Grab, None);
+        }
+        if ui.add_enabled(faces > 0, egui::Button::new("Flip normals")).clicked() {
+            let f = self.active_faces();
+            self.push_undo();
+            self.mesh_mut().flip_faces(&f);
+        }
+        if ui.add_enabled(any, egui::Button::new("Select linked   L")).clicked() {
+            self.select_linked();
+        }
     }
 
     pub fn start_loop_cut(&mut self) {
@@ -1355,7 +1362,7 @@ impl eframe::App for App {
                 ui.label(&self.status);
             });
         });
-        egui::Panel::right("tools").resizable(false).exact_size(250.0).show(ui, |ui| ui.add_enabled_ui(idle, |ui| self.tool_panel(ui)));
+        egui::Panel::right("tools").resizable(false).exact_size(272.0).show(ui, |ui| ui.add_enabled_ui(idle, |ui| self.tool_panel(ui)));
         if self.show_uv {
             egui::Panel::left("uv").resizable(true).default_size(440.0).min_size(200.0).show(ui, |ui| {
                 ui.add_enabled_ui(idle, |ui| {

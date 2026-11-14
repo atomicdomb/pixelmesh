@@ -11,7 +11,17 @@ fn main() {
         let all = (0..m.faces.len()).collect();
         m.uv_box_project(&all, 16.0, Vec2::new(16.0, 16.0));
     }
-    let objects = [FbxObject { name: "Crate", mesh: &cube }, FbxObject { name: "Spike", mesh: &cone }];
+    // A third object with its own pivot and orientation: a cube turned 30 degrees about Y, pivot at its base.
+    let (origin, rotation) = (Vec3::new(-2.0, 0.0, 1.0), Vec3::new(0.0, 30.0, 0.0));
+    let mut turned = Mesh::cube();
+    for p in &mut turned.positions {
+        *p = origin + pixelmesh::xform::euler_quat(rotation) * *p;
+    }
+    let objects = [
+        FbxObject::baked("Crate", &cube),
+        FbxObject::baked("Spike", &cone),
+        FbxObject { name: "Turned", mesh: &turned, origin, rotation },
+    ];
 
     // 16x16 checker so UV orientation is visible after import.
     let img = image::RgbaImage::from_fn(16, 16, |x, y| {

@@ -1,7 +1,7 @@
 //! 3D viewport: navigation, picking, the move-arrow gizmo, modal
 //! move/rotate/scale and frame building.
 
-use crate::app::{App, SelMode, SelectTool};
+use crate::app::{edge_key, App, Edge, SelMode, SelectTool};
 use crate::render::{Batch, FrameData};
 use eframe::egui::{self, Color32, Key, PointerButton, Pos2, Sense, Stroke};
 use eframe::egui_glow;
@@ -27,6 +27,8 @@ pub struct Modal {
     axis_name: &'static str,
     /// (object, vertex) pairs being moved, parallel to `orig`.
     targets: Vec<(usize, u32)>,
+    /// Object mode: (object, original origin, original rotation) of the objects being transformed.
+    objs: Vec<(usize, Vec3, Vec3)>,
     orig: Vec<Vec3>,
     pivot: Vec3,
     start_mouse: Option<Pos2>,
@@ -84,6 +86,7 @@ struct Preview {
 pub struct Sel {
     objects: BTreeSet<usize>,
     verts: BTreeSet<u32>,
+    edges: BTreeSet<Edge>,
     faces: BTreeSet<usize>,
 }
 
@@ -110,7 +113,34 @@ fn combine(base: &Sel, hits: &Sel, op: SelOp) -> Sel {
             SelOp::Subtract => a.difference(b).copied().collect(),
         }
     }
-    Sel { objects: set(&base.objects, &hits.objects, op), verts: set(&base.verts, &hits.verts, op), faces: set(&base.faces, &hits.faces, op) }
+    Sel {
+        objects: set(&base.objects, &hits.objects, op),
+        verts: set(&base.verts, &hits.verts, op),
+        edges: set(&base.edges, &hits.edges, op),
+        faces: set(&base.faces, &hits.faces, op),
+    }
+}
+
+/// What a modal transform does to a point this frame.
+enum Xf {
+    Translate(Vec3),
+    Rotate(Quat),
+    /// Scale factor, optionally only along one direction.
+    Scale(f32, Option<Vec3>),
+}
+
+impl Xf {
+    fn apply(&self, pivot: Vec3, p: Vec3) -> Vec3 {
+        match *self {
+            Xf::Translate(d) => p + d,
+            Xf::Rotate(q) => pivot + q * (p - pivot),
+            Xf::Scale(s, None) => pivot + (p - pivot) * s,
+            Xf::Scale(s, Some(a)) => {
+                let d = p - pivot;
+                pivot + d + a * d.dot(a) * (s - 1.0)
+            }
+        }
+    }
 }
 
 /// Screen-space layout of the three move arrows.
@@ -130,8 +160,12 @@ const ARROW_PX: f32 = 85.0;
 
 impl App {
     pub fn start_modal(&mut self, kind: ModalKind, axis: Option<Vec3>) {
-        if self.transform_targets().is_empty() {
+        if self.transform_targets().is_empty() && self.transform_objects().is_empty() {
             self.status = "Nothing selected.".into();
+            return;
+        }
+        if self.sel_mode == SelMode::Object && self.origin_only && kind != ModalKind::Grab {
+            self.status = "\"Origin\" is on: only moving applies to origins. Turn it off to rotate or scale the object.".into();
             return;
         }
         self.push_undo();
@@ -140,16 +174,18 @@ impl App {
 
     pub fn start_modal_no_undo(&mut self, kind: ModalKind, axis: Option<Vec3>) {
         let targets = self.transform_targets();
-        if targets.is_empty() {
+        let objs: Vec<(usize, Vec3, Vec3)> = self.transform_objects().into_iter().map(|i| (i, self.objects[i].origin, self.objects[i].rotation)).collect();
+        if targets.is_empty() && objs.is_empty() {
             return;
         }
         let orig: Vec<Vec3> = targets.iter().map(|&(o, v)| self.objects[o].mesh.positions[v as usize]).collect();
-        let pivot = self.pivot_of(&orig);
+        let Some(pivot) = self.selection_pivot() else { return };
         self.modal = Some(Modal {
             kind,
             axis,
             axis_name: if axis.is_some() { "normal" } else { "" },
             targets,
+            objs,
             orig,
             pivot,
             start_mouse: None,
@@ -170,10 +206,18 @@ impl App {
         }
     }
 
-    /// Centre of whatever the transform tools would act on.
+    /// Centre of whatever the transform tools would act on. A single object turns about its origin.
     fn selection_pivot(&self) -> Option<Vec3> {
+        let objs = self.transform_objects();
+        if objs.len() == 1 {
+            return Some(self.objects[objs[0]].origin);
+        }
         let targets = self.transform_targets();
-        if targets.is_empty() || !self.objects.get(self.active).is_some_and(|o| o.visible) && self.sel_mode != SelMode::Object {
+        if targets.is_empty() {
+            // "Origin only" with several objects: the middle of their origins.
+            return (!objs.is_empty()).then(|| objs.iter().map(|&i| self.objects[i].origin).sum::<Vec3>() / objs.len() as f32);
+        }
+        if self.sel_mode != SelMode::Object && !self.objects.get(self.active).is_some_and(|o| o.visible) {
             return None;
         }
         let pts: Vec<Vec3> = targets.iter().map(|&(o, v)| self.objects[o].mesh.positions[v as usize]).collect();
@@ -192,41 +236,45 @@ impl App {
 
     fn update_modal(&mut self, rect: egui::Rect, mouse: Pos2, snap: bool) {
         let Some(mut m) = self.modal.take() else { return };
-        if let Some(new) = self.modal_positions(&mut m, rect, mouse, snap) {
+        if let Some(xf) = self.modal_xf(&mut m, rect, mouse, snap) {
             for (i, &(o, v)) in m.targets.iter().enumerate() {
-                self.objects[o].mesh.positions[v as usize] = new[i];
+                self.objects[o].mesh.positions[v as usize] = xf.apply(m.pivot, m.orig[i]);
+            }
+            // Origins travel with their objects, and a rotation is added to the recorded orientation.
+            for &(o, origin, rotation) in &m.objs {
+                self.objects[o].origin = xf.apply(m.pivot, origin);
+                if let Xf::Rotate(q) = xf {
+                    self.objects[o].rotation = pixelmesh::xform::quat_euler(q * pixelmesh::xform::euler_quat(rotation));
+                }
             }
         }
         self.modal = Some(m);
     }
 
-    fn modal_positions(&self, m: &mut Modal, rect: egui::Rect, mouse: Pos2, snap: bool) -> Option<Vec<Vec3>> {
+    fn modal_xf(&self, m: &mut Modal, rect: egui::Rect, mouse: Pos2, snap: bool) -> Option<Xf> {
         let start = *m.start_mouse.get_or_insert(mouse);
         let cam = &self.camera;
         let toward_viewer = cam.back();
         let step = self.grid_snap;
 
         Some(match m.kind {
-            ModalKind::Grab => {
-                let delta = match m.axis {
-                    Some(a) => {
-                        let t = line_param(m.pivot, a, cam.ray(rect, mouse)) - line_param(m.pivot, a, cam.ray(rect, start));
-                        let t = if snap { (t / step).round() * step } else { t };
-                        m.readout = format!("{t:.3}");
-                        a * t
+            ModalKind::Grab => Xf::Translate(match m.axis {
+                Some(a) => {
+                    let t = line_param(m.pivot, a, cam.ray(rect, mouse)) - line_param(m.pivot, a, cam.ray(rect, start));
+                    let t = if snap { (t / step).round() * step } else { t };
+                    m.readout = format!("{t:.3}");
+                    a * t
+                }
+                None => {
+                    let hit = |p: Pos2| plane_hit(m.pivot, toward_viewer, cam.ray(rect, p));
+                    let mut d = hit(mouse) - hit(start);
+                    if snap {
+                        d = (d / step).round() * step;
                     }
-                    None => {
-                        let hit = |p: Pos2| plane_hit(m.pivot, toward_viewer, cam.ray(rect, p));
-                        let mut d = hit(mouse) - hit(start);
-                        if snap {
-                            d = (d / step).round() * step;
-                        }
-                        m.readout = format!("{:.3}, {:.3}, {:.3}", d.x, d.y, d.z);
-                        d
-                    }
-                };
-                m.orig.iter().map(|&p| p + delta).collect()
-            }
+                    m.readout = format!("{:.3}, {:.3}, {:.3}", d.x, d.y, d.z);
+                    d
+                }
+            }),
             ModalKind::Rotate => {
                 let centre = cam.project(rect, m.pivot)?;
                 let angle_of = |p: Pos2| (p.y - centre.y).atan2(p.x - centre.x);
@@ -241,8 +289,7 @@ impl App {
                     angle = (angle / step).round() * step;
                 }
                 m.readout = format!("{:.1}°", angle.to_degrees());
-                let q = Quat::from_axis_angle(axis.normalize(), angle);
-                m.orig.iter().map(|&p| m.pivot + q * (p - m.pivot)).collect()
+                Xf::Rotate(Quat::from_axis_angle(axis.normalize(), angle))
             }
             ModalKind::Scale => {
                 let centre = cam.project(rect, m.pivot)?;
@@ -251,13 +298,7 @@ impl App {
                     s = (s * 10.0).round() / 10.0;
                 }
                 m.readout = format!("×{s:.3}");
-                m.orig.iter().map(|&p| {
-                    let d = p - m.pivot;
-                    m.pivot + match m.axis {
-                        Some(a) => d + a * d.dot(a) * (s - 1.0),
-                        None => d * s,
-                    }
-                }).collect()
+                Xf::Scale(s, m.axis)
             }
         })
     }
@@ -290,9 +331,8 @@ impl App {
             };
             // Keep the selection valid for the rebuilt mesh: the inset faces, or the new bevel faces.
             let fallback = if op.kind == OpKind::Inset || value > 0.0 { result_faces } else { BTreeSet::new() };
-            self.sel_verts = mesh.verts_of_faces(&fallback);
-            self.sel_faces = fallback;
             *self.mesh_mut() = mesh;
+            self.select_faces(fallback);
         }
         if key(Key::Enter) || resp.clicked_by(PointerButton::Primary) {
             if op.value <= 0.0 {
@@ -474,6 +514,10 @@ impl App {
             self.set_mode(SelMode::Object);
         } else if pressed(Key::V) {
             self.set_mode(SelMode::Vertex);
+        } else if pressed(Key::D) && !shift {
+            self.set_mode(SelMode::Edge);
+        } else if pressed(Key::M) {
+            self.merge_selected_faces();
         } else if pressed(Key::F) {
             self.set_mode(SelMode::Face);
         } else if pressed(Key::Q) {
@@ -527,6 +571,17 @@ impl App {
                     }
                 }
             }
+            SelMode::Edge => {
+                let hit = self.edge_near(rect, pos, 10.0);
+                if !additive {
+                    self.sel_edges.clear();
+                }
+                if let Some(e) = hit {
+                    if !self.sel_edges.remove(&e) || !additive {
+                        self.sel_edges.insert(e);
+                    }
+                }
+            }
             SelMode::Vertex => {
                 let mesh = self.mesh();
                 let mut best: Option<(u32, f32)> = None;
@@ -565,7 +620,7 @@ impl App {
     }
 
     fn current_sel(&self) -> Sel {
-        Sel { objects: self.sel_objects.clone(), verts: self.sel_verts.clone(), faces: self.sel_faces.clone() }
+        Sel { objects: self.sel_objects.clone(), verts: self.sel_verts.clone(), edges: self.sel_edges.clone(), faces: self.sel_faces.clone() }
     }
 
     fn set_sel(&mut self, sel: Sel) {
@@ -580,6 +635,7 @@ impl App {
                 self.sel_objects = sel.objects;
             }
             SelMode::Vertex => self.sel_verts = sel.verts,
+            SelMode::Edge => self.sel_edges = sel.edges,
             SelMode::Face => self.sel_faces = sel.faces,
         }
     }
@@ -612,6 +668,18 @@ impl App {
                     }
                 }
             }
+            SelMode::Edge => {
+                // An edge counts when both ends, or its middle, are inside the region.
+                let mesh = self.mesh();
+                for (a, b) in mesh.edges() {
+                    let (pa, pb) = (mesh.positions[a as usize], mesh.positions[b as usize]);
+                    let mid = (pa + pb) * 0.5;
+                    let (Some(sa), Some(sb), Some(sm)) = (self.camera.project(rect, pa), self.camera.project(rect, pb), self.camera.project(rect, mid)) else { continue };
+                    if ((inside(sa) && inside(sb)) || inside(sm)) && (!self.only_visible || self.point_visible(rect, mid, sm, None)) {
+                        hits.edges.insert(edge_key(a, b));
+                    }
+                }
+            }
             SelMode::Face => {
                 let mesh = self.mesh();
                 for f in 0..mesh.faces.len() {
@@ -627,6 +695,90 @@ impl App {
             }
         }
         hits
+    }
+
+    /// Nearest visible edge within `reach` screen pixels of `pos`.
+    fn edge_near(&self, rect: egui::Rect, pos: Pos2, reach: f32) -> Option<Edge> {
+        let mesh = self.mesh();
+        let mut best: Option<(Edge, f32)> = None;
+        for (a, b) in mesh.edges() {
+            let (pa, pb) = (mesh.positions[a as usize], mesh.positions[b as usize]);
+            let (Some(sa), Some(sb)) = (self.camera.project(rect, pa), self.camera.project(rect, pb)) else { continue };
+            let d = segment_distance(pos, sa, sb);
+            if d > reach || best.is_some_and(|(_, bd)| bd <= d) {
+                continue;
+            }
+            // Judge visibility at the point of the edge nearest the cursor.
+            let t = ((pos - sa).dot(sb - sa) / (sb - sa).length_sq().max(1e-6)).clamp(0.05, 0.95);
+            let p = pa.lerp(pb, t);
+            if self.camera.project(rect, p).is_some_and(|sp| self.point_visible(rect, p, sp, None)) {
+                best = Some(((a, b), d));
+            }
+        }
+        best.map(|(e, _)| e)
+    }
+
+    /// Alt+click / double-click: select the whole loop through the edge under the cursor.
+    fn pick_loop(&mut self, rect: egui::Rect, pos: Pos2, additive: bool) {
+        let Some((a, b)) = self.pick_edge(rect, pos) else { return };
+        match self.sel_mode {
+            SelMode::Object => {}
+            SelMode::Edge => {
+                let edges = self.mesh().edge_loop(a, b);
+                if !additive {
+                    self.sel_edges.clear();
+                }
+                self.sel_edges.extend(edges);
+            }
+            SelMode::Vertex => {
+                let edges = self.mesh().edge_loop(a, b);
+                if !additive {
+                    self.sel_verts.clear();
+                }
+                self.sel_verts.extend(edges.into_iter().flat_map(|(a, b)| [a, b]));
+            }
+            SelMode::Face => {
+                // The band of quads running across the edge nearest the cursor.
+                let faces = self.mesh().edge_ring(a, b).faces();
+                if !additive {
+                    self.sel_faces.clear();
+                }
+                self.sel_faces.extend(faces);
+            }
+        }
+    }
+
+    /// Right-click on something that is not selected selects it first, so the menu acts on what was clicked.
+    fn pick_for_menu(&mut self, rect: egui::Rect, pos: Pos2) {
+        let (origin, dir) = self.camera.ray(rect, pos);
+        match self.sel_mode {
+            SelMode::Object => {
+                let hit = self.objects.iter().enumerate()
+                    .filter(|(_, o)| o.visible)
+                    .filter_map(|(i, o)| o.mesh.raycast(origin, dir).map(|(_, t)| (i, t)))
+                    .min_by(|a, b| a.1.total_cmp(&b.1));
+                if let Some((i, _)) = hit {
+                    if !self.sel_objects.contains(&i) {
+                        self.select_object(i, false);
+                    }
+                }
+            }
+            SelMode::Face => {
+                if let Some((f, _)) = self.mesh().raycast(origin, dir) {
+                    if !self.sel_faces.contains(&f) {
+                        self.sel_faces = [f].into();
+                    }
+                }
+            }
+            SelMode::Edge => {
+                if let Some(e) = self.edge_near(rect, pos, 10.0) {
+                    if !self.sel_edges.contains(&e) {
+                        self.sel_edges = [e].into();
+                    }
+                }
+            }
+            SelMode::Vertex => {}
+        }
     }
 
     fn build_frame(&self, rect: egui::Rect) -> FrameData {
@@ -646,6 +798,8 @@ impl App {
         grid.line(Vec3::new(0.0, 0.0, -8.0), Vec3::new(0.0, 0.0, 8.0), [0.3, 0.5, 0.95, 0.7]);
 
         let active_verts = self.active_verts();
+        let inv_view = self.camera.view().inverse();
+        let (cam_right, cam_up) = (inv_view.transform_vector3(Vec3::X), inv_view.transform_vector3(Vec3::Y));
         for (oi, obj) in self.objects.iter().enumerate() {
             if !obj.visible {
                 continue;
@@ -656,8 +810,8 @@ impl App {
             for (fi, face) in mesh.faces.iter().enumerate() {
                 let normal = mesh.face_normal(fi);
                 let tint = if face_mode && self.sel_faces.contains(&fi) { [1.0, 0.55, 0.1, 0.35] } else { [0.0; 4] };
-                for k in 1..face.verts.len() - 1 {
-                    for c in [0, k, k + 1] {
+                for tri in mesh.triangulate(fi) {
+                    for c in tri {
                         tris.push(mesh.positions[face.verts[c] as usize], normal, face.uvs[c], tint);
                     }
                 }
@@ -666,7 +820,12 @@ impl App {
             let object_selected = object_mode && self.sel_objects.contains(&oi);
             for (a, b) in mesh.edges() {
                 // Selected objects are outlined whole (the active one brighter); in edit modes only selected edges light up.
-                let selected = object_selected || (!object_mode && is_active && active_verts.contains(&a) && active_verts.contains(&b));
+                let selected = object_selected
+                    || (is_active && match self.sel_mode {
+                        SelMode::Object => false,
+                        SelMode::Edge => self.sel_edges.contains(&edge_key(a, b)),
+                        _ => active_verts.contains(&a) && active_verts.contains(&b),
+                    });
                 let c = if !selected {
                     [0.04, 0.04, 0.06, 0.9]
                 } else if object_mode && is_active {
@@ -674,6 +833,14 @@ impl App {
                 } else {
                     ORANGE
                 };
+                if selected && !object_mode {
+                    // Lines are one pixel wide; redraw selected edges a pixel to each side so they stand out.
+                    let (pa, pb) = (mesh.positions[a as usize], mesh.positions[b as usize]);
+                    let px = self.camera.units_per_pixel(rect, (pa + pb) * 0.5);
+                    for offset in [cam_right * px, -cam_right * px, cam_up * px, -cam_up * px] {
+                        lines.line(pa + offset, pb + offset, c);
+                    }
+                }
                 lines.line(mesh.positions[a as usize], mesh.positions[b as usize], c);
             }
             if is_active && self.sel_mode == SelMode::Vertex {
@@ -731,6 +898,7 @@ impl App {
         }
 
         // ---- tools
+        let was_busy = self.busy();
         let mut box_rect: Option<egui::Rect> = None;
         let mut preview = Preview::default();
         // Snapping is on when the toggle is set; holding Ctrl flips it for the moment.
@@ -790,9 +958,11 @@ impl App {
                         m.drag = true;
                     }
                 }
-            } else if resp.clicked_by(PointerButton::Primary) && !mods.alt && grabbed.is_none() {
+            } else if resp.clicked_by(PointerButton::Primary) && grabbed.is_none() {
                 if let Some(pos) = resp.interact_pointer_pos() {
-                    if self.select_tool == SelectTool::Circle {
+                    if (mods.alt || resp.double_clicked()) && self.sel_mode != SelMode::Object {
+                        self.pick_loop(rect, pos, mods.shift);
+                    } else if self.select_tool == SelectTool::Circle {
                         // A single dab of the circle brush.
                         let base = if op == SelOp::Replace { Sel::default() } else { self.current_sel() };
                         let hits = self.region_hits(rect, circle(pos, self.circle_radius), pos);
@@ -825,6 +995,16 @@ impl App {
                     self.region = Some(region);
                 }
             }
+        }
+
+        // ---- right-click menu (not while a tool is running: there right-click cancels)
+        if !was_busy {
+            if resp.secondary_clicked() {
+                if let Some(pos) = resp.interact_pointer_pos() {
+                    self.pick_for_menu(rect, pos);
+                }
+            }
+            resp.context_menu(|ui| self.context_menu(ui));
         }
 
         // ---- draw scene
@@ -861,6 +1041,16 @@ impl App {
                 painter.text(tip + dir * 10.0, egui::Align2::CENTER_CENTER, AXES[i].1, egui::FontId::proportional(12.0), color);
             }
             painter.circle_filled(g.centre, 3.5, Color32::WHITE);
+        }
+
+        // ---- origin markers: selected objects in object mode, the edited object otherwise
+        let marked: Vec<usize> = if self.sel_mode == SelMode::Object { self.transform_objects() } else { vec![self.active] };
+        for i in marked {
+            let Some(p) = self.objects.get(i).filter(|o| o.visible).and_then(|o| self.camera.project(rect, o.origin)) else { continue };
+            let ring = if self.origin_only && self.sel_mode == SelMode::Object { 6.5 } else { 5.0 };
+            painter.circle_stroke(p, ring, Stroke::new(2.5, Color32::from_black_alpha(160)));
+            painter.circle_stroke(p, ring, Stroke::new(1.5, Color32::from_rgb(255, 158, 44)));
+            painter.circle_filled(p, 1.5, Color32::WHITE);
         }
 
         // ---- selection tool overlays
@@ -920,14 +1110,16 @@ impl App {
             None => match self.sel_mode {
                 _ if self.select_tool == SelectTool::Box => "Drag a box to select · Shift add · Ctrl remove · Q back to click select",
                 _ if self.select_tool == SelectTool::Circle => "Paint with the circle to select · Shift add · Ctrl remove · [ ] radius · Q back to click select",
+                SelMode::Object if self.origin_only => "Origin mode: drag an arrow or press G to move only the origin (orange ring) · click the Origin tile to leave",
                 SelMode::Object => "Click an object to select · Shift+click add · Drag an arrow to move · G/R/S transform · Tab to edit faces",
-                _ => "Click select · Shift+click add · Drag an arrow to move · G/R/S transform · E extrude · Tab back to objects",
+                _ => "Click select · Shift adds · Alt/double-click loop · Right-click menu · G/R/S transform · Tab back to objects",
             }.to_string(),
         };
         painter.text(rect.left_bottom() + egui::vec2(8.0, -8.0), egui::Align2::LEFT_BOTTOM, hint, font.clone(), Color32::from_gray(200));
         let mode = match self.sel_mode {
             SelMode::Object => "Object mode",
             SelMode::Vertex => "Vertex mode",
+            SelMode::Edge => "Edge mode",
             SelMode::Face => "Face mode",
         };
         let name = self.objects.get(self.active).map_or("no object", |o| o.name.as_str());

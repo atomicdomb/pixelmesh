@@ -22,7 +22,7 @@ fn load(bytes: &[u8]) -> ufbx::SceneRoot {
 #[test]
 fn geometry_and_uvs_survive() {
     let mesh = sample_mesh();
-    let bytes = export_bytes(&[FbxObject { name: "Thing", mesh: &mesh }], &FbxOptions { material_name: "Mat", texture: None, scale: 1.0 });
+    let bytes = export_bytes(&[FbxObject::baked("Thing", &mesh)], &FbxOptions { material_name: "Mat", texture: None, scale: 1.0 });
     let scene = load(&bytes);
 
     assert_eq!(scene.metadata.version, 7400);
@@ -63,7 +63,7 @@ fn texture_is_linked_and_embedded() {
     let mesh = sample_mesh();
     let png = b"\x89PNG fake bytes for the test";
     let opt = FbxOptions { material_name: "Mat", scale: 1.0, texture: Some(FbxTexture { file_name: "sheet.png", embed: Some(png) }) };
-    let scene = load(&export_bytes(&[FbxObject { name: "Thing", mesh: &mesh }], &opt));
+    let scene = load(&export_bytes(&[FbxObject::baked("Thing", &mesh)], &opt));
 
     assert_eq!(scene.materials.len(), 1);
     let mat = &scene.materials[0];
@@ -72,7 +72,7 @@ fn texture_is_linked_and_embedded() {
     assert_eq!(tex.content.as_ref(), png);
 
     let opt = FbxOptions { material_name: "Mat", scale: 1.0, texture: Some(FbxTexture { file_name: "sheet.png", embed: None }) };
-    let scene = load(&export_bytes(&[FbxObject { name: "Thing", mesh: &mesh }], &opt));
+    let scene = load(&export_bytes(&[FbxObject::baked("Thing", &mesh)], &opt));
     assert!(scene.materials[0].fbx.diffuse_color.texture.as_ref().unwrap().content.is_empty());
 }
 
@@ -80,7 +80,7 @@ fn texture_is_linked_and_embedded() {
 fn every_object_becomes_its_own_model() {
     let cube = Mesh::cube();
     let cone = Mesh::cylinder(6, 0.5, 0.0, 1.0).translated(Vec3::new(2.0, 0.0, 0.0));
-    let objects = [FbxObject { name: "Crate", mesh: &cube }, FbxObject { name: "Spike", mesh: &cone }];
+    let objects = [FbxObject::baked("Crate", &cube), FbxObject::baked("Spike", &cone)];
     let opt = FbxOptions { material_name: "Mat", scale: 1.0, texture: Some(FbxTexture { file_name: "sheet.png", embed: None }) };
     let scene = load(&export_bytes(&objects, &opt));
 

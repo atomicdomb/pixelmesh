@@ -22,7 +22,19 @@ pub struct FbxTexture<'a> {
 /// One scene object; each becomes its own Model + Geometry in the file.
 pub struct FbxObject<'a> {
     pub name: &'a str,
+    /// Geometry in world space.
     pub mesh: &'a Mesh,
+    /// The object's pivot in world space; written as the model's translation.
+    pub origin: glam::Vec3,
+    /// The object's orientation as XYZ Euler angles in degrees; written as the model's rotation.
+    pub rotation: glam::Vec3,
+}
+
+impl<'a> FbxObject<'a> {
+    /// An object whose pivot is the world origin, with no rotation.
+    pub fn baked(name: &'a str, mesh: &'a Mesh) -> Self {
+        FbxObject { name, mesh, origin: glam::Vec3::ZERO, rotation: glam::Vec3::ZERO }
+    }
 }
 
 pub struct FbxOptions<'a> {
@@ -186,8 +198,17 @@ const TEXTURE_ID: i64 = 1_000_004;
 const VIDEO_ID: i64 = 1_000_005;
 
 /// Geometry + Model nodes for one object.
-fn object_nodes(index: usize, name: &str, mesh: &Mesh, scale: f32) -> (Node, Node) {
+fn object_nodes(index: usize, obj: &FbxObject, scale: f32) -> (Node, Node) {
     let (geometry_id, model_id) = ids(index);
+    let name = obj.name;
+    // The file stores geometry relative to the model's pivot and orientation.
+    let to_local = crate::xform::euler_quat(obj.rotation).inverse();
+    let local = Mesh {
+        positions: obj.mesh.positions.iter().map(|&p| to_local * (p - obj.origin)).collect(),
+        faces: obj.mesh.faces.clone(),
+    };
+    let mesh = &local;
+    let origin = obj.origin * scale;
 
     // ---- geometry arrays
     let vertices: Vec<f64> = mesh.positions.iter().flat_map(|p| {
@@ -264,8 +285,8 @@ fn object_nodes(index: usize, name: &str, mesh: &Mesh, scale: f32) -> (Node, Nod
         .p(s("Mesh"))
         .c(Node::leaf("Version", Prop::I32(232)))
         .c(Node::new("Properties70")
-            .c(p70_vec("Lcl Translation", "Lcl Translation", "", "A", [0.0; 3]))
-            .c(p70_vec("Lcl Rotation", "Lcl Rotation", "", "A", [0.0; 3]))
+            .c(p70_vec("Lcl Translation", "Lcl Translation", "", "A", [origin.x as f64, origin.y as f64, origin.z as f64]))
+            .c(p70_vec("Lcl Rotation", "Lcl Rotation", "", "A", [obj.rotation.x as f64, obj.rotation.y as f64, obj.rotation.z as f64]))
             .c(p70_vec("Lcl Scaling", "Lcl Scaling", "", "A", [1.0; 3]))
             .c(p70_int("DefaultAttributeIndex", 0))
             .c(p70("InheritType", "enum", "", "", vec![Prop::I32(1)])))
@@ -299,7 +320,7 @@ pub fn export_bytes(objects: &[FbxObject], opt: &FbxOptions) -> Vec<u8> {
     let mut connections = Node::new("Connections");
     for (i, obj) in objects.iter().enumerate() {
         let (geometry_id, model_id) = ids(i);
-        let (geometry, model) = object_nodes(i, obj.name, obj.mesh, opt.scale);
+        let (geometry, model) = object_nodes(i, obj, opt.scale);
         objects_node = objects_node.c(geometry).c(model);
         connections = connections
             .c(Node::new("C").p(s("OO")).p(Prop::I64(model_id)).p(Prop::I64(0)))

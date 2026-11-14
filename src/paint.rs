@@ -4,6 +4,7 @@
 use crate::app::App;
 use eframe::egui::{self, Color32, Key, PointerButton, Pos2, Rect, Sense, Stroke};
 use glam::Vec2;
+use pixelmesh::icons::Icon;
 use pixelmesh::pixels::{self, Rgba};
 use std::sync::Arc;
 
@@ -17,13 +18,13 @@ pub enum Tool {
     Rect,
 }
 
-const TOOLS: [(Tool, &str, &str); 6] = [
-    (Tool::Pencil, "Pencil (B)", "Left button paints the foreground colour, right button the background colour"),
-    (Tool::Eraser, "Eraser (E)", "Makes pixels transparent"),
-    (Tool::Fill, "Fill (G)", "Fills the connected area of one colour"),
-    (Tool::Picker, "Picker (I)", "Picks a colour from the image. Holding Alt with any tool does the same"),
-    (Tool::Line, "Line (L)", "Drag to draw a straight line"),
-    (Tool::Rect, "Rect (U)", "Drag to draw a rectangle"),
+const TOOLS: [(Tool, Icon, &str, &str); 6] = [
+    (Tool::Pencil, Icon::Pencil, "Pencil", "Pencil  (B)\nLeft button paints the foreground colour, right button the background colour"),
+    (Tool::Eraser, Icon::Eraser, "Eraser", "Eraser  (E)\nMakes pixels transparent"),
+    (Tool::Fill, Icon::Fill, "Fill", "Fill  (G)\nFills the connected area of one colour"),
+    (Tool::Picker, Icon::Picker, "Picker", "Colour picker  (I)\nHolding Alt with any tool does the same"),
+    (Tool::Line, Icon::Line, "Line", "Line  (L)\nDrag to draw a straight line"),
+    (Tool::Rect, Icon::Rect, "Rect", "Rectangle  (U)\nDrag to draw a rectangle"),
 ];
 
 /// A small general-purpose starting palette.
@@ -103,9 +104,13 @@ fn color32(c: Rgba) -> Color32 {
 
 impl App {
     fn paint_toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            for (tool, label, tip) in TOOLS {
-                ui.selectable_value(&mut self.paint.tool, tool, label).on_hover_text(tip);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let w = ((ui.available_width() - 4.0 * 5.0) / 6.0).floor().min(64.0);
+            for (tool, icon, label, tip) in TOOLS {
+                if self.tile(ui, icon, label, self.paint.tool == tool, w).on_hover_text(tip).clicked() {
+                    self.paint.tool = tool;
+                }
             }
         });
         ui.horizontal(|ui| {

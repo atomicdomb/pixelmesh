@@ -21,7 +21,7 @@ fn own_export_round_trips_exactly() {
     let mut cone = Mesh::cylinder(6, 0.5, 0.0, 1.0).translated(Vec3::new(2.0, 0.0, 0.0));
     let all = (0..cone.faces.len()).collect();
     cone.uv_box_project(&all, 16.0, Vec2::splat(64.0));
-    let objects = [FbxObject { name: "Crate", mesh: &cube }, FbxObject { name: "Spike", mesh: &cone }];
+    let objects = [FbxObject::baked("Crate", &cube), FbxObject::baked("Spike", &cone)];
     let png = b"\x89PNG not really";
     let opt = FbxOptions { material_name: "Mat", scale: 1.0, texture: Some(FbxTexture { file_name: "sheet.png", embed: Some(png) }) };
 
@@ -91,4 +91,30 @@ fn blender_export_other_axes_and_units() {
 #[test]
 fn rubbish_is_rejected() {
     assert!(import_bytes(b"this is not an fbx file", Path::new(".")).is_err());
+}
+
+#[test]
+fn origin_and_rotation_survive_a_round_trip() {
+    use pixelmesh::xform::euler_quat;
+    // A cube turned and moved: world-space vertices plus the pivot / orientation that go with them.
+    let (origin, rotation) = (Vec3::new(2.0, 0.5, -1.0), Vec3::new(20.0, 45.0, -30.0));
+    let q = euler_quat(rotation);
+    let mut cube = Mesh::cube();
+    for p in &mut cube.positions {
+        *p = origin + q * *p;
+    }
+    let objects = [FbxObject { name: "Turned", mesh: &cube, origin, rotation }];
+    let bytes = export_bytes(&objects, &FbxOptions { material_name: "Mat", scale: 1.0, texture: None });
+    let back = import_bytes(&bytes, Path::new(".")).unwrap();
+    let got = &back.objects[0];
+    assert!(got.origin.distance(origin) < 1e-5, "{}", got.origin);
+    assert!(euler_quat(got.rotation).angle_between(q) < 1e-3, "{}", got.rotation);
+    // The geometry is back where it was in the world.
+    for (a, b) in got.mesh.positions.iter().zip(&cube.positions) {
+        assert!(a.distance(*b) < 1e-5, "{a} vs {b}");
+    }
+    // And in the file it is stored unrotated: an axis-aligned unit cube around the pivot.
+    let scene = ufbx::load_memory(&bytes, ufbx::LoadOpts::default()).unwrap();
+    let local = &scene.meshes[0].vertices;
+    assert!(local.iter().all(|v| [v.x, v.y, v.z].iter().all(|c| (c.abs() - 0.5).abs() < 1e-5 || c.abs() < 1e-5 || (c - 1.0).abs() < 1e-5)));
 }

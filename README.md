@@ -28,8 +28,8 @@ next to it hides or shows it.
 
 - **Object mode**: transforms move the whole selected object. Adding a mesh
   creates a new object.
-- **Vertex / Face mode**: edit the selected object. Adding a mesh adds it
-  to that object.
+- **Vertex / Edge / Face mode**: edit the selected object. Adding a mesh
+  adds it to that object.
 
 Tab switches between object mode and the last edit mode.
 
@@ -40,7 +40,17 @@ selected objects into the active one, shown in bold.
 
 ## Selection tools
 
-Pick the tool under "Mode"; all three work on objects, vertices and faces.
+Pick the tool in the Select card; all three work on objects, vertices,
+edges and faces.
+
+**Loops**: Alt+click or double-click selects a whole loop: the edge loop
+through the edge under the cursor (edge and vertex mode), or the band of
+faces across it (face mode). Shift adds to the selection.
+
+**Right-click** in the 3D view opens a menu for the current selection:
+delete, merge faces, extrude, inset, bevel, loop cut, duplicate, flip.
+Right-clicking a face or object that is not selected selects it first.
+(Right-*drag* still orbits.)
 
 | Tool | How it selects |
 |------|----------------|
@@ -52,6 +62,28 @@ For box and circle: a plain drag starts a new selection, Shift adds to the
 current one, Ctrl removes from it. "Only visible" skips vertices and faces
 hidden behind geometry; untick it to select straight through the mesh.
 
+## Origin and rotation
+
+Every object has an **origin** (its pivot, drawn as an orange ring) and a
+recorded **rotation**. In object mode the Transform card shows both:
+
+- **Pos**: position of the origin. Editing it moves the object.
+- **Rot**: rotation in degrees about the origin (applied X, then Y, then
+  Z). Type a value or drag the field; set it back to 0 to undo a rotation.
+  Rotating with R updates these numbers too.
+- **Origin tile**: while it is on, moving (arrows, G, or the fields, now
+  labelled "Origin") shifts only the origin and leaves the geometry alone.
+- **Origin to**: Centre (middle of the bounding box), Base (bottom centre),
+  World 0, or, in an edit mode, Selection (middle of what is selected).
+
+A single object rotates and scales about its origin; several selected
+objects turn about the middle of the group. Editing vertices, edges or
+faces never moves the origin. New primitives start with the origin at the
+centre of their base.
+
+Origin and rotation are written to FBX as each model's position and
+rotation, and read back on import.
+
 ## Moving things
 
 - **Arrows**: drag the red / green / blue arrow to move the selection along
@@ -60,6 +92,14 @@ hidden behind geometry; untick it to select straight through the mesh.
   steps of that distance. Holding Ctrl flips the setting while dragging.
   (Rotation snaps to 15 degrees, scale to 0.1.)
 - **Keyboard**: G / R / S as below.
+
+## Merge faces
+
+Select two or more adjoining faces and choose "Join" in the Mesh card,
+"Merge faces" in the right-click menu, or press M. Each connected group
+becomes one polygon and keeps its texture mapping. Vertices on the outline
+stay if a neighbouring face still uses them. A group is skipped when its
+outline is not a single loop (for example a ring of faces round a hole).
 
 ## Inset, bevel, loop cut
 
@@ -87,7 +127,10 @@ faces keep their texture exactly in place through all three.
 | Drag an arrow | Move along that axis |
 | Middle- or right-drag (or Alt+left-drag) | Orbit; with Shift: pan |
 | Scroll | Zoom |
-| Tab, O / V / F | Toggle object-edit, object / vertex / face mode |
+| Tab, O / V / D / F | Toggle object-edit, object / vertex / edge / face mode |
+| Alt+click or double-click | Select a loop |
+| Right-click | Context menu |
+| M | Merge selected faces |
 | Q / B / C | Click / box / circle select tool |
 | Ctrl+J | Merge selected objects |
 | A / Alt+A / L | Select all / none / linked (edit modes) |
@@ -174,8 +217,11 @@ File > Import FBX adds every mesh in the file to the scene as its own
 object (or pass the file on the command line: `pixelmesh model.fbx`).
 Binary and ASCII FBX are both read.
 
-- Object transforms, the file's up axis and its unit are baked in, so
-  models arrive Y-up and in metres whatever program wrote them.
+- The file's up axis and unit are converted, so models arrive Y-up and in
+  metres whatever program wrote them. Each object keeps its pivot as its
+  origin and its orientation as its rotation; scale is applied to the
+  vertices. (Files from Z-up programs such as Blender usually carry a 90
+  degree X rotation on every object; it shows up in the Rot fields.)
 - Polygons (triangles, quads, n-gons) and the first UV set are kept.
   Faces without UVs get a default "fit to texture" mapping.
 - If no texture is loaded yet, the file's diffuse / base-colour texture
@@ -188,8 +234,8 @@ Binary and ASCII FBX are both read.
 
 File > Export FBX writes binary FBX 7.4: Y-up, 1 unit = 1 metre. Every
 object becomes its own named model with flat normals and one UV set; all
-share one material with the texture on the diffuse slot. Object positions
-are baked into the vertices, so every model's pivot is the scene origin. The
+share one material with the texture on the diffuse slot. Each model's
+pivot and rotation are the object's origin and rotation. The
 texture is referenced by file name (a copy is placed next to the .fbx if
 missing) or embedded if "Embed texture in FBX" is ticked.
 
@@ -201,7 +247,9 @@ imports FBX files written by Blender (`tests/fixtures`).
 - `src/mesh.rs` - mesh data, primitives, edit and UV operations (unit tested)
 - `src/fbx.rs` - FBX writer
 - `src/fbx_import.rs` - FBX reader (via ufbx)
-- `src/app.rs` - state, menus, tool panel, files
+- `src/app.rs` - state, menus, files
+- `src/sidebar.rs`, `src/icons.rs` - tool panel, theme and the pixel-art icons (drawn in code;
+  `cargo run --example icon_sheet -- icons.png` renders them all for review)
 - `src/viewport.rs` - 3D view, picking, modal transforms
 - `src/uv_editor.rs` - UV editor
 - `src/paint.rs`, `src/pixels.rs` - paint tab and its pixel operations (unit tested)

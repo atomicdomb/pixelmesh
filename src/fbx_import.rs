@@ -11,7 +11,12 @@ use std::path::{Path, PathBuf};
 
 pub struct ImportedObject {
     pub name: String,
+    /// Geometry in world space.
     pub mesh: Mesh,
+    /// The node's pivot in world space.
+    pub origin: Vec3,
+    /// The node's world orientation as XYZ Euler angles in degrees.
+    pub rotation: Vec3,
 }
 
 pub struct ImportedTexture {
@@ -102,8 +107,20 @@ pub fn import_bytes(bytes: &[u8], base_dir: &Path) -> Result<Imported, String> {
         if out.texture.is_none() {
             out.texture = node.materials.iter().find_map(|m| texture_of(m, base_dir));
         }
+        // Pivot and orientation of the node itself (scale is baked into the vertices).
+        let w = &node.node_to_world;
+        let origin = Vec3::new(w.m03 as f32, w.m13 as f32, w.m23 as f32);
+        let mut axes = glam::Mat3::from_cols(
+            Vec3::new(w.m00 as f32, w.m10 as f32, w.m20 as f32).normalize_or(Vec3::X),
+            Vec3::new(w.m01 as f32, w.m11 as f32, w.m21 as f32).normalize_or(Vec3::Y),
+            Vec3::new(w.m02 as f32, w.m12 as f32, w.m22 as f32).normalize_or(Vec3::Z),
+        );
+        if axes.determinant() < 0.0 {
+            axes.x_axis = -axes.x_axis; // mirrored node: a rotation cannot express the flip
+        }
+        let rotation = crate::xform::quat_euler(glam::Quat::from_mat3(&axes));
         let name = if node.element.name.is_empty() { "Object".to_string() } else { node.element.name.to_string() };
-        out.objects.push(ImportedObject { name, mesh });
+        out.objects.push(ImportedObject { name, mesh, origin, rotation });
     }
     if out.objects.is_empty() {
         return Err("the file contains no meshes".into());

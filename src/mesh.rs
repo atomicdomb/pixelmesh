@@ -26,6 +26,13 @@ fn quad_uvs() -> Vec<Vec2> {
     vec![Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(1.0, 1.0), Vec2::new(0.0, 1.0)]
 }
 
+impl EdgeRing {
+    /// The quads the ring passes through (a "face loop").
+    pub fn faces(&self) -> BTreeSet<usize> {
+        self.quads.iter().map(|q| q.0).collect()
+    }
+}
+
 impl Mesh {
     // ---------------------------------------------------------------- queries
 
@@ -63,14 +70,219 @@ impl Mesh {
         set.into_iter().collect()
     }
 
+    /// Split a face into triangles (as corner indices). Uses ear clipping, so
+    /// concave polygons, which merging faces readily produces, come out right.
+    pub fn triangulate(&self, f: usize) -> Vec<[usize; 3]> {
+        let verts = &self.faces[f].verts;
+        let n = verts.len();
+        if n < 3 {
+            return Vec::new();
+        }
+        if n == 3 {
+            return vec![[0, 1, 2]];
+        }
+        let fan = |idx: &[usize]| (1..idx.len() - 1).map(|i| [idx[0], idx[i], idx[i + 1]]).collect::<Vec<_>>();
+        let normal = self.face_normal(f);
+        if normal == Vec3::ZERO {
+            return fan(&(0..n).collect::<Vec<_>>());
+        }
+        // 2D coordinates in the face plane, counter-clockwise.
+        let t = normal.any_orthonormal_vector();
+        let b = normal.cross(t);
+        let pts: Vec<Vec2> = verts.iter().map(|&v| {
+            let p = self.positions[v as usize];
+            Vec2::new(p.dot(t), p.dot(b))
+        }).collect();
+        let cross = |o: Vec2, a: Vec2, b: Vec2| (a - o).perp_dot(b - o);
+        let mut idx: Vec<usize> = (0..n).collect();
+        let mut tris = Vec::with_capacity(n - 2);
+        while idx.len() > 3 {
+            let m = idx.len();
+            let ear = (0..m).find(|&i| {
+                let (p, c, nx) = (idx[(i + m - 1) % m], idx[i], idx[(i + 1) % m]);
+                if cross(pts[p], pts[c], pts[nx]) <= 1e-12 {
+                    return false; // reflex or flat corner
+                }
+                // No other corner may lie inside the candidate triangle, or on its border.
+                let eps = -1e-9;
+                idx.iter().all(|&o| {
+                    o == p || o == c || o == nx
+                        || !(cross(pts[p], pts[c], pts[o]) >= eps && cross(pts[c], pts[nx], pts[o]) >= eps && cross(pts[nx], pts[p], pts[o]) >= eps)
+                })
+            });
+            match ear {
+                Some(i) => {
+                    tris.push([idx[(i + m - 1) % m], idx[i], idx[(i + 1) % m]]);
+                    idx.remove(i);
+                }
+                None => {
+                    // Degenerate polygon: fall back to a fan for what is left.
+                    tris.extend(fan(&idx));
+                    return tris;
+                }
+            }
+        }
+        tris.push([idx[0], idx[1], idx[2]]);
+        tris
+    }
+
+    /// The edge loop through edge (a, b): it continues at each end through the
+    /// one edge that does not share a triangle or quad with the current edge
+    /// (straight on through a grid; along the rim of a cap).
+    pub fn edge_loop(&self, a: u32, b: u32) -> Vec<(u32, u32)> {
+        let key = |a: u32, b: u32| (a.min(b), a.max(b));
+        let mut edge_faces: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        let mut vert_edges: HashMap<u32, BTreeSet<(u32, u32)>> = HashMap::new();
+        for (fi, f) in self.faces.iter().enumerate() {
+            for i in 0..f.verts.len() {
+                let e = key(f.verts[i], f.verts[(i + 1) % f.verts.len()]);
+                edge_faces.entry(e).or_default().push(fi);
+                vert_edges.entry(e.0).or_default().insert(e);
+                vert_edges.entry(e.1).or_default().insert(e);
+            }
+        }
+        let start = key(a, b);
+        if !edge_faces.contains_key(&start) {
+            return Vec::new();
+        }
+        let share_small_face = |e1: (u32, u32), e2: (u32, u32)| {
+            edge_faces[&e1].iter().any(|f| self.faces[*f].verts.len() <= 4 && edge_faces[&e2].contains(f))
+        };
+        let mut seen: BTreeSet<(u32, u32)> = [start].into();
+        let mut result = vec![start];
+        for mut v in [b, a] {
+            let mut cur = start;
+            loop {
+                let next: Vec<(u32, u32)> = vert_edges[&v].iter().copied().filter(|&e| e != cur && !share_small_face(cur, e)).collect();
+                let [e] = next[..] else { break };
+                if !seen.insert(e) {
+                    break;
+                }
+                result.push(e);
+                v = if e.0 == v { e.1 } else { e.0 };
+                cur = e;
+            }
+        }
+        result
+    }
+
+    /// Join each connected group of the given faces into a single polygon.
+    /// Groups whose outline is not one simple loop (a hole, or two parts
+    /// touching at a point) are left alone. Returns the new faces and how
+    /// many groups were skipped.
+    pub fn merge_faces(&mut self, faces: &BTreeSet<usize>) -> (BTreeSet<usize>, usize) {
+        let key = |a: u32, b: u32| (a.min(b), a.max(b));
+        // Group the faces by shared edges.
+        let mut edge_owner: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        for &f in faces {
+            let v = &self.faces[f].verts;
+            for i in 0..v.len() {
+                edge_owner.entry(key(v[i], v[(i + 1) % v.len()])).or_default().push(f);
+            }
+        }
+        let mut group_of: HashMap<usize, usize> = HashMap::new();
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for &seed in faces {
+            if group_of.contains_key(&seed) {
+                continue;
+            }
+            let id = groups.len();
+            let mut members = vec![seed];
+            group_of.insert(seed, id);
+            let mut i = 0;
+            while i < members.len() {
+                let v = self.faces[members[i]].verts.clone();
+                for k in 0..v.len() {
+                    for &other in &edge_owner[&key(v[k], v[(k + 1) % v.len()])] {
+                        if !group_of.contains_key(&other) {
+                            group_of.insert(other, id);
+                            members.push(other);
+                        }
+                    }
+                }
+                i += 1;
+            }
+            groups.push(members);
+        }
+
+        let mut merged: Vec<Face> = Vec::new();
+        let mut remove: BTreeSet<usize> = BTreeSet::new();
+        let mut skipped = 0;
+        for members in groups.iter().filter(|g| g.len() >= 2) {
+            let inside: BTreeSet<usize> = members.iter().copied().collect();
+            let mut directed: HashMap<(u32, u32), Vec2> = HashMap::new(); // edge -> uv at its start corner
+            for &f in members {
+                let face = &self.faces[f];
+                for i in 0..face.verts.len() {
+                    directed.insert((face.verts[i], face.verts[(i + 1) % face.verts.len()]), face.uvs[i]);
+                }
+            }
+            // Outline: edges whose opposite direction is not in the group.
+            let mut next: HashMap<u32, (u32, Vec2)> = HashMap::new();
+            let mut simple = true;
+            let mut outline_len = 0;
+            for (&(a, b), &uv) in &directed {
+                if !directed.contains_key(&(b, a)) {
+                    outline_len += 1;
+                    simple &= next.insert(a, (b, uv)).is_none();
+                }
+            }
+            let Some(&first) = next.keys().min() else {
+                skipped += 1;
+                continue;
+            };
+            let mut verts = Vec::new();
+            let mut uvs = Vec::new();
+            let mut cur = first;
+            while simple && verts.len() <= outline_len {
+                let Some(&(to, uv)) = next.get(&cur) else {
+                    simple = false;
+                    break;
+                };
+                verts.push(cur);
+                uvs.push(uv);
+                cur = to;
+                if cur == first {
+                    break;
+                }
+            }
+            if !simple || verts.len() != outline_len || verts.len() < 3 {
+                skipped += 1;
+                continue;
+            }
+            // Drop corners that are now just a point on a straight edge and that nothing else uses.
+            let used_outside: BTreeSet<u32> = self.faces.iter().enumerate()
+                .filter(|(i, _)| !inside.contains(i))
+                .flat_map(|(_, f)| f.verts.iter().copied())
+                .collect();
+            let mut i = 0;
+            while verts.len() > 3 && i < verts.len() {
+                let n = verts.len();
+                let (p, c, nx) = (self.positions[verts[(i + n - 1) % n] as usize], self.positions[verts[i] as usize], self.positions[verts[(i + 1) % n] as usize]);
+                let straight = (c - p).cross(nx - c).length() <= 1e-5 * (c - p).length().max(1e-6) * (nx - c).length().max(1e-6);
+                if straight && !used_outside.contains(&verts[i]) {
+                    verts.remove(i);
+                    uvs.remove(i);
+                } else {
+                    i += 1;
+                }
+            }
+            merged.push(Face { verts, uvs });
+            remove.extend(members);
+        }
+        // Add first, then delete, so vertices kept alive only by the new faces survive the clean-up.
+        let count = merged.len();
+        self.faces.extend(merged);
+        self.delete_faces(&remove);
+        ((self.faces.len() - count..self.faces.len()).collect(), skipped)
+    }
+
     /// Ray cast against all faces. Returns (face index, distance along ray).
     pub fn raycast(&self, origin: Vec3, dir: Vec3) -> Option<(usize, f32)> {
         let mut best: Option<(usize, f32)> = None;
         for (fi, f) in self.faces.iter().enumerate() {
-            let p0 = self.positions[f.verts[0] as usize];
-            for i in 1..f.verts.len().saturating_sub(1) {
-                let p1 = self.positions[f.verts[i] as usize];
-                let p2 = self.positions[f.verts[i + 1] as usize];
+            for [a, b, c] in self.triangulate(fi) {
+                let (p0, p1, p2) = (self.positions[f.verts[a] as usize], self.positions[f.verts[b] as usize], self.positions[f.verts[c] as usize]);
                 if let Some(t) = ray_triangle(origin, dir, p0, p1, p2) {
                     if best.map_or(true, |(_, bt)| t < bt) {
                         best = Some((fi, t));
@@ -1190,6 +1402,83 @@ mod tests {
         assert_eq!((m.faces.len(), m.positions.len()), (11, 18));
         assert!(is_closed(&m) && normals_point_out(&m));
         assert!(m.faces.iter().all(|f| f.verts.len() == f.uvs.len()));
+    }
+
+    #[test]
+    fn edge_loops() {
+        // Around the middle of a cube after a loop cut: four edges, closed.
+        let mut m = Mesh::cube();
+        let ring = m.edge_ring(1, 2);
+        let new = m.loop_cut(&ring, &[0.5]);
+        let l = m.edge_loop(new[0], new[1]);
+        assert_eq!(l.len(), 4);
+        assert!(l.iter().all(|(a, b)| new.contains(a) && new.contains(b)));
+        // A plain cube edge ends at both corners (three edges meet there).
+        assert_eq!(Mesh::cube().edge_loop(0, 1).len(), 1);
+        // Rim of a cylinder: all the way round, not down the sides.
+        let c = Mesh::cylinder(8, 0.5, 0.5, 1.0);
+        let rim = c.edge_loop(0, 1);
+        assert_eq!(rim.len(), 8);
+        assert!(rim.iter().all(|&(a, b)| a < 8 && b < 8));
+        // Face loop round the cylinder's side.
+        assert_eq!(c.edge_ring(0, 8).faces().len(), 8);
+    }
+
+    #[test]
+    fn merge_faces_into_ngons() {
+        // Undo a loop cut on one side: two quads become one again, mesh stays closed.
+        let mut m = Mesh::cube();
+        let ring = m.edge_ring(1, 2);
+        m.loop_cut(&ring, &[0.5]);
+        assert_eq!(m.faces.len(), 10);
+        let front: BTreeSet<usize> = (0..m.faces.len()).filter(|&f| m.face_normal(f).z > 0.9).collect();
+        assert_eq!(front.len(), 2);
+        let (new, skipped) = m.merge_faces(&front);
+        assert_eq!((new.len(), skipped, m.faces.len()), (1, 0, 9));
+        let f = *new.iter().next().unwrap();
+        // The cut vertices are still used by the neighbouring sides, so they stay: a hexagon.
+        assert_eq!(m.faces[f].verts.len(), 6);
+        assert!((face_area(&m, f) - 1.0).abs() < 1e-5);
+        assert!(is_closed(&m) && normals_point_out(&m));
+        let (lo, hi) = m.uv_bounds(&new).unwrap();
+        assert!(lo.abs_diff_eq(Vec2::ZERO, 1e-6) && hi.abs_diff_eq(Vec2::ONE, 1e-6));
+
+        // A flat 2x1 strip with nothing around it: the middle vertices disappear.
+        let mut strip = Mesh::plane();
+        strip.append(&Mesh::plane().translated(Vec3::X));
+        strip.merge_by_distance(1e-4);
+        let (new, _) = strip.merge_faces(&[0, 1].into());
+        assert_eq!((strip.faces.len(), strip.positions.len()), (1, 4));
+        assert_eq!(strip.faces[*new.iter().next().unwrap()].verts.len(), 4);
+
+        // Two separate pairs are merged separately; faces that only touch at a corner are not merged.
+        let mut m = Mesh::cube();
+        let (new, skipped) = m.merge_faces(&[0, 1].into()); // front and back: not connected
+        assert_eq!((new.len(), skipped, m.faces.len()), (0, 0, 6));
+        // Three faces round a corner form one simple outline.
+        let (new, skipped) = m.merge_faces(&[0, 2, 4].into());
+        assert_eq!((new.len(), skipped, m.faces.len()), (1, 0, 4));
+        assert!(is_closed(&m));
+    }
+
+    #[test]
+    fn triangulate_concave_polygon() {
+        // An L shape: fan triangulation from corner 0 would spill outside it.
+        let mut m = Mesh::default();
+        let pts = [(0., 0.), (2., 0.), (2., 1.), (1., 1.), (1., 2.), (0., 2.)];
+        m.positions = pts.iter().map(|&(x, z)| Vec3::new(x, 0.0, -z)).collect();
+        m.faces.push(Face { verts: (0..6).collect(), uvs: vec![Vec2::ZERO; 6] });
+        let tris = m.triangulate(0);
+        assert_eq!(tris.len(), 4);
+        let area: f32 = tris.iter().map(|t| {
+            let [a, b, c] = t.map(|i| m.positions[i]);
+            (b - a).cross(c - a).y * 0.5
+        }).sum();
+        assert!((area - 3.0).abs() < 1e-5);
+        assert!(tris.iter().all(|t| { let [a, b, c] = t.map(|i| m.positions[i]); (b - a).cross(c - a).y > 0.0 }));
+        // The notch is empty: a ray through it misses, one through the L hits.
+        assert!(m.raycast(Vec3::new(1.5, 1.0, -1.5), Vec3::NEG_Y).is_none());
+        assert!(m.raycast(Vec3::new(0.5, 1.0, -1.5), Vec3::NEG_Y).is_some());
     }
 
     #[test]
