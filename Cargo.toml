@@ -7,12 +7,11 @@ description = "A slimmed-down low-poly mesh editor with pixel-art UV mapping and
 [dependencies]
 eframe = { version = "0.37", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 glam = { version = "0.30", features = ["serde"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tga"] }
 rfd = "0.18"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-[dev-dependencies]
+# FBX parser used for import (a small C library; needs a C compiler at build time).
 ufbx = "0.11"
 
 [profile.dev]

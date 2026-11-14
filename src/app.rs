@@ -168,7 +168,15 @@ impl App {
         for a in args {
             let p = Path::new(a);
             match p.extension().and_then(|e| e.to_str()) {
-                Some("png") => app.load_texture(&cc.egui_ctx, p),
+                Some("png" | "jpg" | "jpeg" | "bmp" | "tga") => app.load_texture(&cc.egui_ctx, p),
+                Some("fbx" | "FBX") => {
+                    // Opening an FBX directly: start from just that file.
+                    if app.undo.is_empty() {
+                        app.objects.clear();
+                        app.sel_objects.clear();
+                    }
+                    app.import_fbx(&cc.egui_ctx, p);
+                }
                 Some("pmesh") => app.open_project(&cc.egui_ctx, p),
                 _ => {}
             }
@@ -490,12 +498,20 @@ impl App {
     // ---------------------------------------------------------------- files
 
     pub fn load_texture(&mut self, ctx: &egui::Context, path: &Path) {
-        let result = std::fs::read(path).map_err(|e| e.to_string()).and_then(|bytes| {
-            let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?.to_rgba8();
-            Ok((bytes, img))
-        });
-        match result {
-            Ok((file_bytes, img)) => {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                self.set_texture(ctx, path, bytes);
+            }
+            Err(e) => self.status = format!("Could not load {}: {e}", path.display()),
+        }
+    }
+
+    /// Use an image file's bytes as the texture. `path` is where it lives (or would live) on disk.
+    /// Returns false when the bytes are not an image this build can decode.
+    fn set_texture(&mut self, ctx: &egui::Context, path: &Path, file_bytes: Vec<u8>) -> bool {
+        match image::load_from_memory(&file_bytes) {
+            Ok(img) => {
+                let img = img.to_rgba8();
                 let size = [img.width(), img.height()];
                 let color = egui::ColorImage::from_rgba_unmultiplied([size[0] as usize, size[1] as usize], img.as_raw());
                 let handle = ctx.load_texture("sheet", color, egui::TextureOptions::NEAREST);
@@ -510,9 +526,59 @@ impl App {
                     mtime: std::fs::metadata(path).and_then(|m| m.modified()).ok(),
                 });
                 self.status = format!("Texture: {} ({}x{})", path.display(), size[0], size[1]);
+                true
             }
-            Err(e) => self.status = format!("Could not load {}: {e}", path.display()),
+            Err(e) => {
+                self.status = format!("Could not load {}: {e}", path.display());
+                false
+            }
         }
+    }
+
+    /// Add the meshes of an FBX file to the scene as new objects.
+    pub fn import_fbx(&mut self, ctx: &egui::Context, path: &Path) {
+        let imported = match pixelmesh::fbx_import::import_file(path) {
+            Ok(i) => i,
+            Err(e) => {
+                self.status = format!("Could not import {}: {e}", path.display());
+                return;
+            }
+        };
+        self.push_undo();
+        let first_new = self.objects.len();
+        for obj in imported.objects {
+            let name = self.unique_name(&obj.name);
+            self.objects.push(Object { name, mesh: obj.mesh, visible: true });
+        }
+        let count = self.objects.len() - first_new;
+        self.sel_mode = SelMode::Object;
+        self.sel_objects = (first_new..self.objects.len()).collect();
+        self.active = self.objects.len() - 1;
+        self.clear_selection();
+        self.frame_all();
+
+        // Pick up the file's texture, unless one is already loaded.
+        let mut notes = Vec::new();
+        if let Some(tex) = imported.texture {
+            let name = tex.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            if self.texture.is_some() {
+                notes.push(format!("kept the current texture (file uses {name})"));
+            } else {
+                let loaded = match tex.embedded {
+                    Some(bytes) => self.set_texture(ctx, &tex.path, bytes),
+                    None => match std::fs::read(&tex.path) {
+                        Ok(bytes) => self.set_texture(ctx, &tex.path, bytes),
+                        Err(_) => false,
+                    },
+                };
+                notes.push(if loaded { format!("texture {name}") } else { format!("texture {name} not found or unreadable") });
+            }
+        }
+        if imported.faces_without_uvs > 0 {
+            notes.push(format!("{} faces had no UVs", imported.faces_without_uvs));
+        }
+        let notes = if notes.is_empty() { String::new() } else { format!(" ({})", notes.join("; ")) };
+        self.status = format!("Imported {count} object(s) from {}{notes}", path.display());
     }
 
     /// Reload the texture when the file changes on disk, so edits in a paint program show up live.
@@ -666,6 +732,11 @@ impl App {
                     self.pick_texture(&ctx);
                 }
                 ui.separator();
+                if ui.button("Import FBX…").on_hover_text("Add the meshes of an FBX file to this scene").clicked() {
+                    if let Some(p) = rfd::FileDialog::new().add_filter("FBX", &["fbx"]).pick_file() {
+                        self.import_fbx(&ctx, &p);
+                    }
+                }
                 if ui.button("Export FBX…").clicked() {
                     self.pick_export();
                 }
@@ -710,7 +781,7 @@ impl App {
     }
 
     fn pick_texture(&mut self, ctx: &egui::Context) {
-        if let Some(p) = rfd::FileDialog::new().add_filter("PNG image", &["png"]).pick_file() {
+        if let Some(p) = rfd::FileDialog::new().add_filter("Image", &["png", "jpg", "jpeg", "bmp", "tga"]).pick_file() {
             self.load_texture(ctx, &p);
         }
     }
@@ -955,7 +1026,7 @@ impl App {
             ui.separator();
             ui.strong("Texture");
             ui.horizontal(|ui| {
-                if ui.button("Load PNG…").clicked() {
+                if ui.button("Load image…").clicked() {
                     self.pick_texture(&ctx);
                 }
                 if self.texture.is_some() && ui.button("Remove").clicked() {

@@ -14,7 +14,7 @@ fn main() -> eframe::Result {
         depth_buffer: 24,
         ..Default::default()
     };
-    // Optional arguments: a .pmesh project and/or a .png texture to open at startup.
+    // Optional arguments: a .pmesh project, an .fbx to import and/or a texture image to open at startup.
     let args: Vec<String> = std::env::args().skip(1).collect();
     eframe::run_native("PixelMesh", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, &args)))))
 }

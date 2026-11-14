@@ -8,7 +8,8 @@ pixel-snapping UV editor for pixel-art textures, and binary FBX export.
     cargo run --release
     cargo run --release -- model.pmesh sheet.png   # open a project / texture directly
 
-Needs a recent stable Rust and OpenGL 3.3. On Linux, file dialogs use the
+Needs a recent stable Rust, a C compiler (for the bundled FBX parser) and
+OpenGL 3.3. On Linux, file dialogs use the
 XDG desktop portal.
 
 ## Layout
@@ -112,6 +113,22 @@ With "Snap UVs to pixels" on, everything lands on texel boundaries.
 1-unit face covers exactly e.g. 16x16 pixels. The texture reloads
 automatically when the PNG changes on disk.
 
+## FBX import
+
+File > Import FBX adds every mesh in the file to the scene as its own
+object (or pass the file on the command line: `pixelmesh model.fbx`).
+Binary and ASCII FBX are both read.
+
+- Object transforms, the file's up axis and its unit are baked in, so
+  models arrive Y-up and in metres whatever program wrote them.
+- Polygons (triangles, quads, n-gons) and the first UV set are kept.
+  Faces without UVs get a default "fit to texture" mapping.
+- If no texture is loaded yet, the file's diffuse / base-colour texture
+  is used: embedded images directly, otherwise the referenced file if it
+  can be found next to the FBX.
+- Not imported: normals (the editor is flat-shaded), extra UV sets, vertex
+  colours, per-face material assignments, rigs and animation.
+
 ## FBX export
 
 File > Export FBX writes binary FBX 7.4: Y-up, 1 unit = 1 metre. Every
@@ -121,12 +138,14 @@ are baked into the vertices, so every model's pivot is the scene origin. The
 texture is referenced by file name (a copy is placed next to the .fbx if
 missing) or embedded if "Embed texture in FBX" is ticked.
 
-`cargo test` round-trips exports through the ufbx parser in strict mode.
+`cargo test` round-trips exports through the ufbx parser in strict mode and
+imports FBX files written by Blender (`tests/fixtures`).
 
 ## Code map
 
 - `src/mesh.rs` - mesh data, primitives, edit and UV operations (unit tested)
 - `src/fbx.rs` - FBX writer
+- `src/fbx_import.rs` - FBX reader (via ufbx)
 - `src/app.rs` - state, menus, tool panel, files
 - `src/viewport.rs` - 3D view, picking, modal transforms
 - `src/uv_editor.rs` - UV editor
