@@ -103,14 +103,14 @@ impl App {
         let active = self.active_faces();
         if self.uv.show_all {
             let stroke = Stroke::new(1.0, Color32::from_rgba_unmultiplied(120, 170, 255, 70));
-            for (fi, face) in self.mesh.faces.iter().enumerate() {
+            for (fi, face) in self.mesh().faces.iter().enumerate() {
                 if !active.contains(&fi) {
                     painter.add(egui::Shape::closed_line(face.uvs.iter().map(|&uv| to_screen(uv)).collect(), stroke));
                 }
             }
         }
         for &fi in &active {
-            let pts: Vec<Pos2> = self.mesh.faces[fi].uvs.iter().map(|&uv| to_screen(uv)).collect();
+            let pts: Vec<Pos2> = self.mesh().faces[fi].uvs.iter().map(|&uv| to_screen(uv)).collect();
             painter.add(egui::Shape::closed_line(pts.clone(), Stroke::new(1.5, Color32::from_rgb(255, 150, 40))));
             for p in pts {
                 painter.circle_filled(p, 3.5, Color32::from_rgb(255, 220, 120));
@@ -126,7 +126,7 @@ impl App {
                 // Nearest corner within reach?
                 let mut best: Option<(Vec2, f32)> = None;
                 for &fi in &active {
-                    for &uv in &self.mesh.faces[fi].uvs {
+                    for &uv in &self.mesh().faces[fi].uvs {
                         let d = to_screen(uv).distance(start);
                         if d <= 9.0 && best.map_or(true, |(_, bd)| d < bd) {
                             best = Some((uv, d));
@@ -137,7 +137,7 @@ impl App {
                     // Corners sharing that UV position move together so islands stay stitched.
                     anchor = hit;
                     for &fi in &active {
-                        for (k, &uv) in self.mesh.faces[fi].uvs.iter().enumerate() {
+                        for (k, &uv) in self.mesh().faces[fi].uvs.iter().enumerate() {
                             if uv.distance(hit) < 1e-5 {
                                 corners.push((fi, k, uv));
                             }
@@ -145,14 +145,14 @@ impl App {
                     }
                 } else {
                     let p = to_uv(start);
-                    if active.iter().any(|&fi| point_in_polygon(p, &self.mesh.faces[fi].uvs)) {
+                    if active.iter().any(|&fi| point_in_polygon(p, &self.mesh().faces[fi].uvs)) {
                         // Grabbed inside a face: move every selected face as one island.
                         for &fi in &active {
-                            for (k, &uv) in self.mesh.faces[fi].uvs.iter().enumerate() {
+                            for (k, &uv) in self.mesh().faces[fi].uvs.iter().enumerate() {
                                 corners.push((fi, k, uv));
                             }
                         }
-                        anchor = self.mesh.uv_bounds(&active).map(|(lo, _)| lo).unwrap_or(Vec2::ZERO);
+                        anchor = self.mesh().uv_bounds(&active).map(|(lo, _)| lo).unwrap_or(Vec2::ZERO);
                     }
                 }
                 if !corners.is_empty() {
@@ -161,7 +161,7 @@ impl App {
                 }
             }
         }
-        if let Some(drag) = &self.uv.drag {
+        if let Some(drag) = self.uv.drag.take() {
             if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
                 let mut delta = to_uv(pos) - to_uv(drag.start);
                 if self.uv.snap {
@@ -169,12 +169,13 @@ impl App {
                     let target = ((drag.anchor + delta) * tex).round() / tex;
                     delta = target - drag.anchor;
                 }
+                let mesh = self.mesh_mut();
                 for &(fi, k, orig) in &drag.corners {
-                    self.mesh.faces[fi].uvs[k] = orig + delta;
+                    mesh.faces[fi].uvs[k] = orig + delta;
                 }
             }
-            if !ui.input(|i| i.pointer.primary_down()) {
-                self.uv.drag = None;
+            if ui.input(|i| i.pointer.primary_down()) {
+                self.uv.drag = Some(drag);
             }
         }
 
@@ -185,7 +186,7 @@ impl App {
             painter.text(rect.left_bottom() + egui::vec2(8.0, -8.0), egui::Align2::LEFT_BOTTOM, text, egui::FontId::proportional(12.0), Color32::from_gray(190));
         }
         if active.is_empty() {
-            painter.text(rect.center_top() + egui::vec2(0.0, 10.0), egui::Align2::CENTER_TOP, "Select faces in the 3D view to edit their UVs", egui::FontId::proportional(12.0), Color32::from_gray(170));
+            painter.text(rect.center_top() + egui::vec2(0.0, 10.0), egui::Align2::CENTER_TOP, "Nothing selected: pick an object, or faces in face mode", egui::FontId::proportional(12.0), Color32::from_gray(170));
         }
     }
 }

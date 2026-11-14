@@ -77,6 +77,12 @@ impl Camera {
         ))
     }
 
+    /// World units covered by one screen pixel at the depth of `p`.
+    pub fn units_per_pixel(&self, rect: Rect, p: Vec3) -> f32 {
+        let depth = if self.ortho { self.distance } else { (self.eye() - p).dot(self.back()).max(0.05) };
+        2.0 * depth * (FOV_Y * 0.5).tan() / rect.height().max(1.0)
+    }
+
     pub fn orbit(&mut self, dx: f32, dy: f32) {
         self.yaw -= dx * 0.008;
         self.pitch = (self.pitch + dy * 0.008).clamp(-1.5707, 1.5707);

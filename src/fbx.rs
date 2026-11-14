@@ -1,6 +1,6 @@
 //! Minimal binary FBX 7.4 writer.
 //!
-//! Writes one mesh with flat normals, one UV set, one material and (optionally)
+//! Writes one model per scene object, each with flat normals, one UV set, plus one shared material and (optionally)
 //! one diffuse texture, either referenced by file name or embedded.
 //! The layout follows what Blender's exporter emits, which both Unity and
 //! Blender's importer read happily. Binary rather than ASCII because Blender
@@ -19,8 +19,15 @@ pub struct FbxTexture<'a> {
     pub embed: Option<&'a [u8]>,
 }
 
-pub struct FbxOptions<'a> {
+/// One scene object; each becomes its own Model + Geometry in the file.
+pub struct FbxObject<'a> {
     pub name: &'a str,
+    pub mesh: &'a Mesh,
+}
+
+pub struct FbxOptions<'a> {
+    /// Name of the single material shared by all objects.
+    pub material_name: &'a str,
     pub texture: Option<FbxTexture<'a>>,
     /// Multiplies all positions on export.
     pub scale: f32,
@@ -170,19 +177,21 @@ fn p70_vec(name: &str, ty: &str, ty2: &str, flags: &str, v: [f64; 3]) -> Node {
 
 // ---------------------------------------------------------------- the document
 
-const GEOMETRY_ID: i64 = 1_000_001;
-const MODEL_ID: i64 = 1_000_002;
+/// (geometry id, model id) for the object at `index`.
+fn ids(index: usize) -> (i64, i64) {
+    (2_000_000 + index as i64, 3_000_000 + index as i64)
+}
 const MATERIAL_ID: i64 = 1_000_003;
 const TEXTURE_ID: i64 = 1_000_004;
 const VIDEO_ID: i64 = 1_000_005;
 
-pub fn export_bytes(mesh: &Mesh, opt: &FbxOptions) -> Vec<u8> {
-    let version = 7400;
-    let has_tex = opt.texture.is_some();
+/// Geometry + Model nodes for one object.
+fn object_nodes(index: usize, name: &str, mesh: &Mesh, scale: f32) -> (Node, Node) {
+    let (geometry_id, model_id) = ids(index);
 
     // ---- geometry arrays
     let vertices: Vec<f64> = mesh.positions.iter().flat_map(|p| {
-        let p = *p * opt.scale;
+        let p = *p * scale;
         [p.x as f64, p.y as f64, p.z as f64]
     }).collect();
 
@@ -214,8 +223,8 @@ pub fn export_bytes(mesh: &Mesh, opt: &FbxOptions) -> Vec<u8> {
     };
 
     let geometry = Node::new("Geometry")
-        .p(Prop::I64(GEOMETRY_ID))
-        .p(name_class(opt.name, "Geometry"))
+        .p(Prop::I64(geometry_id))
+        .p(name_class(name, "Geometry"))
         .p(s("Mesh"))
         .c(Node::leaf("GeometryVersion", Prop::I32(124)))
         .c(Node::leaf("Vertices", Prop::F64s(vertices)))
@@ -250,8 +259,8 @@ pub fn export_bytes(mesh: &Mesh, opt: &FbxOptions) -> Vec<u8> {
             .c(layer_element("LayerElementMaterial")));
 
     let model = Node::new("Model")
-        .p(Prop::I64(MODEL_ID))
-        .p(name_class(opt.name, "Model"))
+        .p(Prop::I64(model_id))
+        .p(name_class(name, "Model"))
         .p(s("Mesh"))
         .c(Node::leaf("Version", Prop::I32(232)))
         .c(Node::new("Properties70")
@@ -265,9 +274,17 @@ pub fn export_bytes(mesh: &Mesh, opt: &FbxOptions) -> Vec<u8> {
         .c(Node::leaf("Shading", Prop::Bool(true)))
         .c(Node::leaf("Culling", s("CullingOff")));
 
+    (geometry, model)
+}
+
+pub fn export_bytes(objects: &[FbxObject], opt: &FbxOptions) -> Vec<u8> {
+    let version = 7400;
+    let has_tex = opt.texture.is_some();
+    let count = objects.len() as i32;
+
     let material = Node::new("Material")
         .p(Prop::I64(MATERIAL_ID))
-        .p(name_class(opt.name, "Material"))
+        .p(name_class(opt.material_name, "Material"))
         .p(s(""))
         .c(Node::leaf("Version", Prop::I32(102)))
         .c(Node::leaf("ShadingModel", s("lambert")))
@@ -278,11 +295,18 @@ pub fn export_bytes(mesh: &Mesh, opt: &FbxOptions) -> Vec<u8> {
             .c(p70_vec("AmbientColor", "Color", "", "A", [0.0; 3]))
             .c(p70_vec("EmissiveColor", "Color", "", "A", [0.0; 3])));
 
-    let mut objects = Node::new("Objects").c(geometry).c(model).c(material);
-    let mut connections = Node::new("Connections")
-        .c(Node::new("C").p(s("OO")).p(Prop::I64(MODEL_ID)).p(Prop::I64(0)))
-        .c(Node::new("C").p(s("OO")).p(Prop::I64(GEOMETRY_ID)).p(Prop::I64(MODEL_ID)))
-        .c(Node::new("C").p(s("OO")).p(Prop::I64(MATERIAL_ID)).p(Prop::I64(MODEL_ID)));
+    let mut objects_node = Node::new("Objects");
+    let mut connections = Node::new("Connections");
+    for (i, obj) in objects.iter().enumerate() {
+        let (geometry_id, model_id) = ids(i);
+        let (geometry, model) = object_nodes(i, obj.name, obj.mesh, opt.scale);
+        objects_node = objects_node.c(geometry).c(model);
+        connections = connections
+            .c(Node::new("C").p(s("OO")).p(Prop::I64(model_id)).p(Prop::I64(0)))
+            .c(Node::new("C").p(s("OO")).p(Prop::I64(geometry_id)).p(Prop::I64(model_id)))
+            .c(Node::new("C").p(s("OO")).p(Prop::I64(MATERIAL_ID)).p(Prop::I64(model_id)));
+    }
+    objects_node = objects_node.c(material);
 
     if let Some(tex) = &opt.texture {
         let tex_name = Path::new(tex.file_name).file_stem().and_then(|x| x.to_str()).unwrap_or("texture");
@@ -315,7 +339,7 @@ pub fn export_bytes(mesh: &Mesh, opt: &FbxOptions) -> Vec<u8> {
             .c(Node::new("ModelUVScaling").p(Prop::F64(1.0)).p(Prop::F64(1.0)))
             .c(Node::leaf("Texture_Alpha_Source", s("None")))
             .c(Node::new("Cropping").p(Prop::I32(0)).p(Prop::I32(0)).p(Prop::I32(0)).p(Prop::I32(0)));
-        objects = objects.c(texture).c(video);
+        objects_node = objects_node.c(texture).c(video);
         connections = connections
             .c(Node::new("C").p(s("OP")).p(Prop::I64(TEXTURE_ID)).p(Prop::I64(MATERIAL_ID)).p(s("DiffuseColor")))
             .c(Node::new("C").p(s("OO")).p(Prop::I64(VIDEO_ID)).p(Prop::I64(TEXTURE_ID)));
@@ -324,10 +348,10 @@ pub fn export_bytes(mesh: &Mesh, opt: &FbxOptions) -> Vec<u8> {
     let object_type = |ty: &str, count: i32| Node::new("ObjectType").p(s(ty)).c(Node::leaf("Count", Prop::I32(count)));
     let mut definitions = Node::new("Definitions")
         .c(Node::leaf("Version", Prop::I32(100)))
-        .c(Node::leaf("Count", Prop::I32(if has_tex { 6 } else { 4 })))
+        .c(Node::leaf("Count", Prop::I32(2 + 2 * count + if has_tex { 2 } else { 0 })))
         .c(object_type("GlobalSettings", 1))
-        .c(object_type("Geometry", 1))
-        .c(object_type("Model", 1))
+        .c(object_type("Geometry", count))
+        .c(object_type("Model", count))
         .c(object_type("Material", 1));
     if has_tex {
         definitions = definitions.c(object_type("Texture", 1)).c(object_type("Video", 1));
@@ -377,7 +401,7 @@ pub fn export_bytes(mesh: &Mesh, opt: &FbxOptions) -> Vec<u8> {
                 .c(Node::leaf("RootNode", Prop::I64(0)))),
         Node::new("References"),
         definitions,
-        objects,
+        objects_node,
         connections,
         Node::new("Takes").c(Node::leaf("Current", s(""))),
     ];
@@ -401,6 +425,6 @@ pub fn export_bytes(mesh: &Mesh, opt: &FbxOptions) -> Vec<u8> {
     out
 }
 
-pub fn export_file(path: &Path, mesh: &Mesh, opt: &FbxOptions) -> io::Result<()> {
-    std::fs::write(path, export_bytes(mesh, opt))
+pub fn export_file(path: &Path, objects: &[FbxObject], opt: &FbxOptions) -> io::Result<()> {
+    std::fs::write(path, export_bytes(objects, opt))
 }

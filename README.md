@@ -15,29 +15,74 @@ XDG desktop portal.
 
 | Area   | What it does |
 |--------|--------------|
-| Left   | UV editor: the texture with the UVs of the selected faces |
+| Left   | UV editor (toggle with the "UV editor" button in the menu bar, or U) |
 | Centre | 3D viewport |
-| Right  | Tools: add meshes, transform, mesh ops, UV mapping, texture, export |
+| Right  | Object list, modes, add meshes, transform, mesh ops, UV mapping, texture, export |
+
+## Objects and modes
+
+The scene is a list of named objects, shown at the top of the right panel.
+Click a name (or click the object in the viewport) to select it; the box
+next to it hides or shows it.
+
+- **Object mode**: transforms move the whole selected object. Adding a mesh
+  creates a new object.
+- **Vertex / Face mode**: edit the selected object. Adding a mesh adds it
+  to that object.
+
+Tab switches between object mode and the last edit mode.
+
+In object mode several objects can be selected at once (Shift+click in the
+list or viewport, or box / circle select); they then move, duplicate and
+delete together. **Merge** (button in the object list, or Ctrl+J) joins all
+selected objects into the active one, shown in bold.
+
+## Selection tools
+
+Pick the tool under "Mode"; all three work on objects, vertices and faces.
+
+| Tool | How it selects |
+|------|----------------|
+| Click (Q) | Click one item; Shift+click adds or removes |
+| Box (B) | Drag a rectangle |
+| Circle (C) | Paint with a circle around the cursor; `[` and `]` change its radius |
+
+For box and circle: a plain drag starts a new selection, Shift adds to the
+current one, Ctrl removes from it. "Only visible" skips vertices and faces
+hidden behind geometry; untick it to select straight through the mesh.
+
+## Moving things
+
+- **Arrows**: drag the red / green / blue arrow to move the selection along
+  X / Y / Z. Works for objects, faces and vertices.
+- **Snapping**: tick "Snap every" and set the distance; moves then jump in
+  steps of that distance. Holding Ctrl flips the setting while dragging.
+  (Rotation snaps to 15 degrees, scale to 0.1.)
+- **Keyboard**: G / R / S as below.
 
 ## 3D viewport
 
 | Input | Action |
 |-------|--------|
 | Click / Shift+click | Select / add to selection |
+| Drag an arrow | Move along that axis |
 | Middle- or right-drag (or Alt+left-drag) | Orbit; with Shift: pan |
 | Scroll | Zoom |
-| V / F | Vertex mode / face mode |
-| A / Alt+A / L | Select all / none / linked |
-| G / R / S | Move / rotate / scale. Then X, Y, Z to lock an axis, Ctrl to snap, click or Enter to confirm, Esc or right-click to cancel |
+| Tab, O / V / F | Toggle object-edit, object / vertex / face mode |
+| Q / B / C | Click / box / circle select tool |
+| Ctrl+J | Merge selected objects |
+| A / Alt+A / L | Select all / none / linked (edit modes) |
+| G / R / S | Move / rotate / scale. Then X, Y, Z to lock an axis, click or Enter to confirm, Esc or right-click to cancel |
 | E | Extrude selected faces along their normal |
-| Shift+D | Duplicate |
-| X or Delete | Delete |
+| Shift+D | Duplicate (object or faces) |
+| X or Delete | Delete (object or faces / vertices) |
+| U | Show / hide the UV editor |
 | 1 / 3 / 7 / 5 / Home | Front / right / top / toggle orthographic / frame all |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo |
 
 ## UV editor
 
-Select faces in the 3D view, then:
+Select an object (all its faces) or individual faces in face mode, then:
 
 - drag a corner to move it (corners sharing the spot move together),
 - drag inside a face to move all selected faces as one island,
@@ -50,8 +95,10 @@ automatically when the PNG changes on disk.
 
 ## FBX export
 
-File > Export FBX writes binary FBX 7.4: Y-up, 1 unit = 1 metre, flat
-normals, one UV set, one material with the texture on the diffuse slot. The
+File > Export FBX writes binary FBX 7.4: Y-up, 1 unit = 1 metre. Every
+object becomes its own named model with flat normals and one UV set; all
+share one material with the texture on the diffuse slot. Object positions
+are baked into the vertices, so every model's pivot is the scene origin. The
 texture is referenced by file name (a copy is placed next to the .fbx if
 missing) or embedded if "Embed texture in FBX" is ticked.
 
