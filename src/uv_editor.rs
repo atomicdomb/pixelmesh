@@ -246,9 +246,14 @@ impl App {
         };
 
         // Scale handles on the selection's bounding box: (screen position, uv position, fixed uv point, axes it scales).
+        // The handles sit on a frame drawn a little outside the selection so they never cover a vertex.
+        const FRAME_PAD: f32 = 12.0;
         let mut handles: Vec<(Pos2, Vec2, Vec2, [bool; 2])> = Vec::new();
         let sel_bounds = self.uv_sel_bounds();
-        if let (Some((lo, hi)), true) = (sel_bounds, self.uv.drag.is_none()) {
+        let frame = sel_bounds
+            .filter(|_| self.uv.sel.len() > 1)
+            .map(|(lo, hi)| Rect::from_two_pos(to_screen(lo), to_screen(hi)).expand(FRAME_PAD));
+        if let (Some((lo, hi)), Some(frame), true) = (sel_bounds, frame, self.uv.drag.is_none()) {
             let size = hi - lo;
             for (ix, iy) in [(0.0, 0.0), (0.5, 0.0), (1.0, 0.0), (0.0, 0.5), (1.0, 0.5), (0.0, 1.0), (0.5, 1.0), (1.0, 1.0)] {
                 let axes = [ix != 0.5, iy != 0.5];
@@ -257,7 +262,9 @@ impl App {
                 }
                 let at = lo + size * Vec2::new(ix, iy);
                 let anchor = lo + size * Vec2::new(1.0 - ix, 1.0 - iy);
-                handles.push((to_screen(at), at, anchor, axes));
+                // Screen Y runs downwards, UV V upwards.
+                let on_frame = Pos2::new(frame.left() + frame.width() * ix, frame.bottom() - frame.height() * iy);
+                handles.push((on_frame, at, anchor, axes));
             }
         }
         let handle_at = |pos: Pos2| handles.iter().find(|h| h.0.distance(pos) <= 8.0).copied();
@@ -312,6 +319,9 @@ impl App {
                 let selected = element.as_ref().is_some_and(|e| e.is_subset(&self.uv.sel));
                 if let Some((_, at, anchor, axes)) = handle_at(start) {
                     action = Action::StartDrag { select: None, kind: DragKind::Handle { anchor, handle: at, axes }, anchor: at, start: Some(start), modal: false };
+                } else if let (Some((lo, _)), true) = (sel_bounds, !selected && op == Op::Replace && frame.is_some_and(|f| f.contains(start))) {
+                    // Dragging anywhere inside the selection frame moves the whole group.
+                    action = Action::StartDrag { select: None, kind: DragKind::Move, anchor: lo, start: Some(start), modal: false };
                 } else if let (Some(e), true) = (&element, selected || tool == SelectTool::Click) {
                     // Drag a selected element to move the selection; in click mode an unselected one is picked up first.
                     let select = (!selected).then(|| if op == Op::Add { combine(&self.uv.sel, e, Op::Add) } else { e.clone() });
@@ -535,16 +545,26 @@ impl App {
                 }
             }
         }
-        // Bounding box with scale handles.
-        if let Some((lo, hi)) = self.uv_sel_bounds().filter(|(lo, hi)| lo.distance(*hi) > 1e-6) {
-            let r = Rect::from_two_pos(to_screen(lo), to_screen(hi));
+        // Selection frame with scale handles; drag inside it to move the group.
+        let frame_now = self.uv_sel_bounds()
+            .filter(|_| self.uv.sel.len() > 1)
+            .map(|(lo, hi)| Rect::from_two_pos(to_screen(lo), to_screen(hi)).expand(FRAME_PAD));
+        if let Some(r) = frame_now {
             painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 245, 170, 150)), egui::StrokeKind::Middle);
             let hover = resp.hover_pos();
+            let mut over_handle = false;
             for (pos, ..) in &handles {
                 let hot = hover.is_some_and(|h| h.distance(*pos) <= 8.0);
+                over_handle |= hot;
                 let square = Rect::from_center_size(*pos, egui::Vec2::splat(if hot { 10.0 } else { 7.0 }));
                 painter.rect_filled(square, 1.0, if hot { Color32::WHITE } else { bright });
                 painter.rect_stroke(square, 1.0, Stroke::new(1.0, Color32::BLACK), egui::StrokeKind::Middle);
+            }
+            // Show what a drag here would do.
+            if self.uv.drag.is_some() || over_handle {
+                ui.ctx().set_cursor_icon(if over_handle { egui::CursorIcon::Crosshair } else { egui::CursorIcon::Grabbing });
+            } else if hover.is_some_and(|h| r.contains(h)) && !mods.shift && !mods.command {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
             }
         }
 
@@ -573,7 +593,7 @@ impl App {
             None => match resp.hover_pos() {
                 Some(p) => {
                     let uv = to_uv(p);
-                    format!("px {:.0}, {:.0}    drag to move · handles or S to scale · G move · A all", (uv.x * tex.x).floor(), ((1.0 - uv.y) * tex.y).floor())
+                    format!("px {:.0}, {:.0}    drag inside the frame to move · handles or S scale · G move", (uv.x * tex.x).floor(), ((1.0 - uv.y) * tex.y).floor())
                 }
                 None => String::new(),
             },

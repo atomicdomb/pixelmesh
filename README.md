@@ -111,11 +111,16 @@ have a separate UV selection.
 | V / F (or the buttons) | Select UV vertices / whole faces |
 | Q / B / C (or the buttons) | Click / box / circle select; Shift adds, Ctrl removes |
 | A / Alt+A | Select all / none |
-| Drag a selected vertex or face | Move the selection |
-| Drag a handle on the selection box | Scale; the opposite side stays put. Shift keeps proportions |
+| Drag inside the selection frame, or drag any selected vertex / face | Move the whole selection as a group |
+| Drag a handle on the selection frame | Scale; the opposite side stays put. Shift keeps proportions |
 | G | Move with the mouse; X / Y lock an axis; click confirms, Esc cancels |
 | S | Scale about the centre; X / Y lock an axis |
 | Scroll, right- or middle-drag | Zoom, pan |
+
+With two or more vertices selected a frame is drawn around them, slightly
+outside so its handles never cover a vertex. A plain drag inside the frame
+moves the group even with the box or circle tool active; hold Shift or Ctrl
+to box / circle select inside it instead.
 
 UV vertices that share a position are picked together, so stitched faces
 stay stitched. In click mode, dragging something unselected selects and
