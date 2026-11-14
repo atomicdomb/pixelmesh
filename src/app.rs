@@ -53,6 +53,19 @@ pub struct Snapshot {
     sel_faces: BTreeSet<usize>,
 }
 
+/// What the left panel shows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LeftTab {
+    Uv,
+    Paint,
+}
+
+/// One step on the undo stack: either the scene or the texture's pixels as they were.
+enum UndoStep {
+    Scene(Snapshot),
+    Pixels { rgba: Arc<Vec<u8>>, size: [u32; 2] },
+}
+
 pub struct Texture {
     pub path: PathBuf,
     pub size: [u32; 2],
@@ -61,6 +74,10 @@ pub struct Texture {
     pub handle: egui::TextureHandle,
     pub version: u64,
     mtime: Option<SystemTime>,
+    /// Painted on since it was last loaded or saved.
+    pub dirty: bool,
+    /// False for a new canvas that has never been saved.
+    pub on_disk: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -96,8 +113,10 @@ pub struct App {
     last_edit_mode: SelMode,
     pub sel_verts: BTreeSet<u32>,
     pub sel_faces: BTreeSet<usize>,
-    undo: Vec<Snapshot>,
-    redo: Vec<Snapshot>,
+    undo: Vec<UndoStep>,
+    redo: Vec<UndoStep>,
+    pub left_tab: LeftTab,
+    pub paint: crate::paint::Paint,
 
     pub camera: Camera,
     pub renderer: Option<Arc<Mutex<Renderer>>>,
@@ -147,6 +166,8 @@ impl App {
             sel_faces: BTreeSet::new(),
             undo: Vec::new(),
             redo: Vec::new(),
+            left_tab: LeftTab::Uv,
+            paint: crate::paint::Paint::default(),
             camera: Camera::default(),
             renderer,
             modal: None,
@@ -373,30 +394,60 @@ impl App {
 
     /// Call before every change to the mesh.
     pub fn push_undo(&mut self) {
-        self.undo.push(self.snapshot());
+        self.push_step(UndoStep::Scene(self.snapshot()));
+    }
+
+    /// Record the texture's pixels as they were before a paint stroke.
+    pub fn push_pixels_undo(&mut self, rgba: Arc<Vec<u8>>, size: [u32; 2]) {
+        self.push_step(UndoStep::Pixels { rgba, size });
+    }
+
+    fn push_step(&mut self, step: UndoStep) {
+        self.undo.push(step);
         if self.undo.len() > 200 {
             self.undo.remove(0);
         }
         self.redo.clear();
     }
 
+    /// Apply a step and return the step that reverses it.
+    fn swap_step(&mut self, step: UndoStep) -> Option<UndoStep> {
+        match step {
+            UndoStep::Scene(s) => {
+                let inverse = UndoStep::Scene(self.snapshot());
+                self.restore(s);
+                Some(inverse)
+            }
+            UndoStep::Pixels { rgba, size } => {
+                let t = self.texture.as_mut()?;
+                let inverse = UndoStep::Pixels { rgba: t.rgba.clone(), size: t.size };
+                t.rgba = rgba;
+                t.size = size;
+                self.texture_changed();
+                Some(inverse)
+            }
+        }
+    }
+
     pub fn undo(&mut self) {
-        if let Some(s) = self.undo.pop() {
-            self.redo.push(self.snapshot());
-            self.restore(s);
+        if let Some(step) = self.undo.pop() {
+            if let Some(inverse) = self.swap_step(step) {
+                self.redo.push(inverse);
+            }
         }
     }
 
     pub fn redo(&mut self) {
-        if let Some(s) = self.redo.pop() {
-            self.undo.push(self.snapshot());
-            self.restore(s);
+        if let Some(step) = self.redo.pop() {
+            if let Some(inverse) = self.swap_step(step) {
+                self.undo.push(inverse);
+            }
         }
     }
 
     /// Throw away the most recent undo step and go back to it (used when a modal tool is cancelled).
     pub fn revert_last(&mut self) {
-        if let Some(s) = self.undo.pop() {
+        if let Some(UndoStep::Scene(s)) = self.undo.pop() {
             self.restore(s);
         }
     }
@@ -527,6 +578,8 @@ impl App {
                     handle,
                     version: self.tex_counter,
                     mtime: std::fs::metadata(path).and_then(|m| m.modified()).ok(),
+                    dirty: false,
+                    on_disk: path.is_file(),
                 });
                 self.status = format!("Texture: {} ({}x{})", path.display(), size[0], size[1]);
                 true
@@ -535,6 +588,87 @@ impl App {
                 self.status = format!("Could not load {}: {e}", path.display());
                 false
             }
+        }
+    }
+
+    /// The texture's pixels were edited: refresh both the 3D view's and the 2D panels' copies.
+    pub fn texture_changed(&mut self) {
+        self.tex_counter += 1;
+        if let Some(t) = &mut self.texture {
+            t.version = self.tex_counter;
+            t.dirty = true;
+            let color = egui::ColorImage::from_rgba_unmultiplied([t.size[0] as usize, t.size[1] as usize], &t.rgba);
+            t.handle.set(color, egui::TextureOptions::NEAREST);
+        }
+    }
+
+    /// Start a blank image of the given size.
+    pub fn new_canvas(&mut self, ctx: &egui::Context, width: u32, height: u32, fill: [u8; 4]) {
+        let (width, height) = (width.clamp(1, 4096), height.clamp(1, 4096));
+        let rgba: Vec<u8> = fill.iter().copied().cycle().take((width * height * 4) as usize).collect();
+        let color = egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], &rgba);
+        let handle = ctx.load_texture("sheet", color, egui::TextureOptions::NEAREST);
+        self.tex_counter += 1;
+        self.texture = Some(Texture {
+            path: PathBuf::from("untitled.png"),
+            size: [width, height],
+            rgba: Arc::new(rgba),
+            file_bytes: Vec::new(),
+            handle,
+            version: self.tex_counter,
+            mtime: None,
+            dirty: true,
+            on_disk: false,
+        });
+        // Old pixel undo steps belong to the previous image.
+        self.undo.retain(|s| matches!(s, UndoStep::Scene(_)));
+        self.redo.clear();
+        self.uv.fit_view();
+        self.status = format!("New {width}x{height} canvas (not saved yet)");
+    }
+
+    fn encode_png(t: &Texture) -> Result<Vec<u8>, String> {
+        let img = image::RgbaImage::from_raw(t.size[0], t.size[1], t.rgba.to_vec()).ok_or("pixel buffer has the wrong size")?;
+        let mut out = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut out, image::ImageFormat::Png).map_err(|e| e.to_string())?;
+        Ok(out.into_inner())
+    }
+
+    /// Write the texture to `path` as a PNG and make that its file from now on.
+    pub fn save_texture_to(&mut self, path: &Path) {
+        let Some(t) = &mut self.texture else { return };
+        let path = path.with_extension("png");
+        let result = Self::encode_png(t).and_then(|bytes| std::fs::write(&path, &bytes).map(|_| bytes).map_err(|e| e.to_string()));
+        match result {
+            Ok(bytes) => {
+                t.file_bytes = bytes;
+                t.mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                t.dirty = false;
+                t.on_disk = true;
+                t.path = path.clone();
+                self.status = format!("Saved image {}", path.display());
+            }
+            Err(e) => self.status = format!("Could not save {}: {e}", path.display()),
+        }
+    }
+
+    /// Save the texture where it came from, or ask for a place if it has none (or is not a PNG).
+    pub fn save_texture(&mut self) {
+        let Some(t) = &self.texture else { return };
+        let is_png = t.path.extension().is_some_and(|e| e.eq_ignore_ascii_case("png"));
+        if t.on_disk && is_png {
+            let path = t.path.clone();
+            self.save_texture_to(&path);
+        } else {
+            self.save_texture_as();
+        }
+    }
+
+    pub fn save_texture_as(&mut self) {
+        let Some(t) = &self.texture else { return };
+        let name = t.path.with_extension("png").file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "untitled.png".into());
+        if let Some(p) = rfd::FileDialog::new().add_filter("PNG image", &["png"]).set_file_name(name).save_file() {
+            self.save_texture_to(&p);
         }
     }
 
@@ -593,6 +727,10 @@ impl App {
         }
         self.last_mtime_check = now;
         if let Some(t) = &self.texture {
+            // Never reload over unsaved paint work.
+            if t.dirty || !t.on_disk {
+                return;
+            }
             let mtime = std::fs::metadata(&t.path).and_then(|m| m.modified()).ok();
             if mtime.is_some() && mtime != t.mtime {
                 let path = t.path.clone();
@@ -658,6 +796,18 @@ impl App {
     }
 
     fn export_fbx(&mut self, path: &Path) {
+        // Painted but unsaved pixels still have to end up in the exported texture.
+        if let Some(t) = &mut self.texture {
+            if t.dirty || t.file_bytes.is_empty() {
+                match Self::encode_png(t) {
+                    Ok(bytes) => t.file_bytes = bytes,
+                    Err(e) => {
+                        self.status = format!("Export failed: could not encode the texture ({e})");
+                        return;
+                    }
+                }
+            }
+        }
         let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Mesh").to_string();
         let tex_name = self.texture.as_ref()
             .and_then(|t| t.path.file_name().and_then(|n| n.to_str()).map(str::to_string));
@@ -690,9 +840,11 @@ impl App {
                     let dest = dir.join(n);
                     if !self.embed_texture && !dest.exists() {
                         match std::fs::write(&dest, &t.file_bytes) {
-                            Ok(()) => msg += &format!(" (+ copied {n})"),
-                            Err(e) => msg += &format!(" (could not copy {n}: {e})"),
+                            Ok(()) => msg += &format!(" (+ wrote {n})"),
+                            Err(e) => msg += &format!(" (could not write {n}: {e})"),
                         }
+                    } else if !self.embed_texture && t.dirty {
+                        msg += &format!(" (note: {n} next to it is older than your unsaved paint changes; save the image)");
                     }
                 }
                 self.status = msg;
@@ -731,8 +883,16 @@ impl App {
                     self.save_as();
                 }
                 ui.separator();
-                if ui.button("Load texture…").clicked() {
+                if ui.button("New image…").clicked() {
+                    self.show_uv = true;
+                    self.left_tab = LeftTab::Paint;
+                    self.paint.open_new_dialog(self.texture.as_ref().map(|t| t.size));
+                }
+                if ui.button("Load image…").clicked() {
                     self.pick_texture(&ctx);
+                }
+                if ui.add_enabled(self.texture.is_some(), egui::Button::new("Save image   Ctrl+S")).clicked() {
+                    self.save_texture();
                 }
                 ui.separator();
                 if ui.button("Import FBX…").on_hover_text("Add the meshes of an FBX file to this scene").clicked() {
@@ -766,14 +926,14 @@ impl App {
                 }
                 ui.checkbox(&mut self.camera.ortho, "Orthographic   5");
                 ui.separator();
-                ui.checkbox(&mut self.show_uv, "UV editor   U");
+                ui.checkbox(&mut self.show_uv, "UV / Paint panel   U");
                 ui.checkbox(&mut self.show_gizmo, "Move arrows");
                 if ui.button("Frame all   Home").clicked() {
                     self.frame_all();
                 }
             });
             ui.separator();
-            ui.toggle_value(&mut self.show_uv, "UV editor").on_hover_text("Show or hide the UV editor (U)");
+            ui.toggle_value(&mut self.show_uv, "UV / Paint panel").on_hover_text("Show or hide the UV editor and paint panel (U)");
         });
     }
 
@@ -1028,7 +1188,12 @@ impl App {
             ui.separator();
             ui.strong("Texture");
             ui.horizontal(|ui| {
-                if ui.button("Load image…").clicked() {
+                if ui.button("New…").clicked() {
+                    self.show_uv = true;
+                    self.left_tab = LeftTab::Paint;
+                    self.paint.open_new_dialog(self.texture.as_ref().map(|t| t.size));
+                }
+                if ui.button("Load…").clicked() {
                     self.pick_texture(&ctx);
                 }
                 if self.texture.is_some() && ui.button("Remove").clicked() {
@@ -1038,8 +1203,8 @@ impl App {
             match &self.texture {
                 Some(t) => {
                     let name = t.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    ui.label(format!("{name}  {}×{}", t.size[0], t.size[1]));
-                    ui.weak("Reloads automatically when the file changes.");
+                    ui.label(format!("{name}{}  {}×{}", if t.dirty { " *" } else { "" }, t.size[0], t.size[1]));
+                    ui.weak(if t.dirty { "Unsaved paint changes (Ctrl+S)." } else { "Reloads automatically when the file changes." });
                 }
                 None => {
                     ui.weak("No texture (64×64 grid assumed).");
@@ -1148,8 +1313,17 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() || self.busy() {
+        if ctx.egui_wants_keyboard_input() || self.busy() || self.paint.is_painting() {
             return;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::S)) {
+            // Save whatever has somewhere to go: the image, and the project if it has a file.
+            if self.texture.as_ref().is_some_and(|t| t.dirty) {
+                self.save_texture();
+            }
+            if let Some(p) = self.project_path.clone() {
+                self.save_project(&p);
+            }
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::J)) {
             self.merge_selected();
@@ -1183,7 +1357,23 @@ impl eframe::App for App {
         });
         egui::Panel::right("tools").resizable(false).exact_size(250.0).show(ui, |ui| ui.add_enabled_ui(idle, |ui| self.tool_panel(ui)));
         if self.show_uv {
-            egui::Panel::left("uv").resizable(true).default_size(440.0).min_size(200.0).show(ui, |ui| ui.add_enabled_ui(idle, |ui| self.uv_editor(ui)));
+            egui::Panel::left("uv").resizable(true).default_size(440.0).min_size(200.0).show(ui, |ui| {
+                ui.add_enabled_ui(idle, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut self.left_tab, LeftTab::Uv, "UV editor");
+                        ui.selectable_value(&mut self.left_tab, LeftTab::Paint, "Paint");
+                        if let Some(t) = &self.texture {
+                            let name = t.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                            ui.weak(format!("{name}{}  {}x{}", if t.dirty { " *" } else { "" }, t.size[0], t.size[1]));
+                        }
+                    });
+                    ui.separator();
+                    match self.left_tab {
+                        LeftTab::Uv => self.uv_editor(ui),
+                        LeftTab::Paint => self.paint_editor(ui),
+                    }
+                })
+            });
         }
         egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| self.viewport(ui));
     }

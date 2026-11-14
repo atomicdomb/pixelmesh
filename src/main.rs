@@ -2,6 +2,7 @@
 
 mod app;
 mod camera;
+mod paint;
 mod render;
 mod uv_editor;
 mod viewport;

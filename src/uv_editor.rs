@@ -82,7 +82,70 @@ impl Default for UvEditor {
     }
 }
 
+/// Mapping between UV space and the panel. The unit square is drawn with the
+/// texture's proportions, so texels are always square on screen.
+#[derive(Clone, Copy)]
+pub struct View {
+    origin: Pos2,
+    /// Screen pixels per UV unit along U and V.
+    scale: Vec2,
+}
+
+impl View {
+    pub fn to_screen(&self, uv: Vec2) -> Pos2 {
+        Pos2::new(self.origin.x + (uv.x - 0.5) * self.scale.x, self.origin.y - (uv.y - 0.5) * self.scale.y)
+    }
+
+    pub fn to_uv(&self, p: Pos2) -> Vec2 {
+        Vec2::new((p.x - self.origin.x) / self.scale.x + 0.5, 0.5 - (p.y - self.origin.y) / self.scale.y)
+    }
+
+    /// Screen rectangle covered by the whole texture.
+    pub fn sheet(&self) -> Rect {
+        Rect::from_two_pos(self.to_screen(Vec2::new(0.0, 1.0)), self.to_screen(Vec2::new(1.0, 0.0)))
+    }
+}
+
 impl UvEditor {
+    /// The current view (shared by the UV and paint tabs), fitting the texture first if asked to.
+    pub fn view(&mut self, rect: Rect, tex: Vec2) -> View {
+        if self.zoom <= 0.0 {
+            self.zoom = rect.width().min(rect.height()) * 0.85;
+            self.pan = egui::Vec2::ZERO;
+        }
+        let longest = tex.max_element().max(1.0);
+        View { origin: rect.center() + self.pan, scale: Vec2::new(self.zoom * tex.x / longest, self.zoom * tex.y / longest) }
+    }
+
+    pub fn fit_view(&mut self) {
+        self.zoom = 0.0;
+    }
+
+    /// Screen pixels per texel.
+    pub fn texel_size(&self, tex: Vec2) -> f32 {
+        self.zoom / tex.max_element().max(1.0)
+    }
+
+    /// Scroll to zoom about the cursor; `panning` says whether this frame's drag pans the view.
+    pub fn navigate(&mut self, ui: &egui::Ui, resp: &egui::Response, rect: Rect, panning: bool) {
+        if self.zoom > 0.0 && resp.hovered() {
+            let (scroll, pinch, hover) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta(), i.pointer.hover_pos()));
+            let factor = (scroll * 0.004).exp() * pinch;
+            if factor != 1.0 {
+                if let Some(hover) = hover {
+                    let centre = rect.center() + self.pan;
+                    let new_zoom = (self.zoom * factor).clamp(40.0, 60000.0);
+                    let k = new_zoom / self.zoom;
+                    self.pan = (hover + (centre - hover) * k) - rect.center();
+                    self.zoom = new_zoom;
+                }
+            }
+        }
+        if panning {
+            self.pan += resp.drag_delta();
+        }
+    }
+
     /// True while a keyboard-started move / scale is following the mouse.
     pub fn is_modal(&self) -> bool {
         self.drag.as_ref().is_some_and(|d| d.modal)
@@ -144,7 +207,6 @@ impl App {
     pub fn uv_editor(&mut self, ui: &mut egui::Ui) {
         let active = self.active_faces();
         ui.horizontal(|ui| {
-            ui.strong("UV editor");
             ui.selectable_value(&mut self.uv.mode, UvMode::Vertex, "Vertex (V)");
             ui.selectable_value(&mut self.uv.mode, UvMode::Face, "Face (F)");
             ui.separator();
@@ -158,7 +220,7 @@ impl App {
                 self.uv_snap_to_pixels(&active);
             }
             if ui.small_button("Fit view").clicked() {
-                self.uv.zoom = 0.0;
+                self.uv.fit_view();
             }
         });
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
@@ -166,35 +228,17 @@ impl App {
         let painter = painter.with_clip_rect(rect);
         painter.rect_filled(rect, 0.0, Color32::from_rgb(34, 36, 40));
 
-        if self.uv.zoom <= 0.0 {
-            self.uv.zoom = rect.width().min(rect.height()) * 0.85;
-            self.uv.pan = egui::Vec2::ZERO;
-        }
         let tex = self.tex_size();
         let (mods, mouse, press, primary_down) =
             ui.input(|i| (i.modifiers, i.pointer.latest_pos(), i.pointer.press_origin(), i.pointer.primary_down()));
 
         // ---- view navigation
-        if resp.hovered() {
-            let (scroll, pinch, hover) = ui.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta(), i.pointer.hover_pos()));
-            let factor = (scroll * 0.004).exp() * pinch;
-            if factor != 1.0 {
-                if let Some(hover) = hover {
-                    // Zoom about the cursor.
-                    let centre = rect.center() + self.uv.pan;
-                    let new_zoom = (self.uv.zoom * factor).clamp(40.0, 60000.0);
-                    let k = new_zoom / self.uv.zoom;
-                    self.uv.pan = (hover + (centre - hover) * k) - rect.center();
-                    self.uv.zoom = new_zoom;
-                }
-            }
-        }
-        if resp.dragged_by(PointerButton::Middle) || resp.dragged_by(PointerButton::Secondary) {
-            self.uv.pan += resp.drag_delta();
-        }
-        let (zoom, origin) = (self.uv.zoom, rect.center() + self.uv.pan);
-        let to_screen = |uv: Vec2| Pos2::new(origin.x + (uv.x - 0.5) * zoom, origin.y - (uv.y - 0.5) * zoom);
-        let to_uv = |p: Pos2| Vec2::new((p.x - origin.x) / zoom + 0.5, 0.5 - (p.y - origin.y) / zoom);
+        let panning = resp.dragged_by(PointerButton::Middle) || resp.dragged_by(PointerButton::Secondary);
+        self.uv.navigate(ui, &resp, rect, panning);
+        let view = self.uv.view(rect, tex);
+        let zoom = self.uv.zoom;
+        let to_screen = |uv: Vec2| view.to_screen(uv);
+        let to_uv = |p: Pos2| view.to_uv(p);
 
         // The UV selection only ever refers to faces currently shown.
         let face_count = self.mesh().faces.len();
@@ -487,7 +531,7 @@ impl App {
         }
 
         // ---- texture and pixel grid
-        let sheet = Rect::from_two_pos(to_screen(Vec2::new(0.0, 1.0)), to_screen(Vec2::new(1.0, 0.0)));
+        let sheet = view.sheet();
         match &self.texture {
             Some(t) => {
                 painter.rect_filled(sheet, 0.0, Color32::from_gray(70));

@@ -16,7 +16,7 @@ XDG desktop portal.
 
 | Area   | What it does |
 |--------|--------------|
-| Left   | UV editor (toggle with the "UV editor" button in the menu bar, or U) |
+| Left   | UV editor and Paint tabs (hide with the "UV / Paint panel" button in the menu bar, or U) |
 | Centre | 3D viewport |
 | Right  | Object list, modes, add meshes, transform, mesh ops, UV mapping, texture, export |
 
@@ -135,6 +135,39 @@ selection now" rounds the selected UVs to the nearest pixel corners.
 unit"), so a 1-unit face covers exactly e.g. 16x16 pixels. The texture
 reloads automatically when the image changes on disk.
 
+## Paint tab (pixel editor)
+
+The left panel has two tabs, "UV editor" and "Paint". Paint edits the
+texture itself; every stroke shows on the model immediately. Both tabs
+share the same zoom and pan.
+
+- **New canvas**: "New…" (or File > New image) asks for a size, with
+  presets such as 32x32 and 256x128, and a fill (white, transparent, or the
+  background colour). Non-square canvases are shown with square pixels.
+- **Save**: "Save" or Ctrl+S writes a PNG ("Save as…" for a new canvas or
+  a new name). A `*` marks unsaved changes. Exporting an FBX always uses
+  the pixels as painted, saved or not.
+- **UV overlay**: toggles the UV outlines of every visible object over the
+  image, with the faces shown in the UV tab highlighted, so you can paint
+  right up to an edge.
+
+| Tool | Key | What it does |
+|------|-----|--------------|
+| Pencil | B | Left button paints the foreground colour, right button the background colour |
+| Eraser | E | Makes pixels transparent |
+| Fill | G | Fills the connected area of one colour |
+| Picker | I | Picks a colour (left: foreground, right: background). Alt with any tool does the same |
+| Line | L | Drag for a straight line |
+| Rect | U | Drag for a rectangle; "Filled rect" fills it |
+
+Other controls: `[` / `]` brush size, X swaps the two colours, scroll
+zooms, middle-drag or Space+drag pans, Ctrl+Z / Ctrl+Shift+Z undo and redo
+strokes (one shared history with mesh edits). The palette row holds 16
+starter colours followed by the colours already used in the image; left-
+click sets the foreground, right-click the background.
+
+Transparent pixels are cut out on the model and in the exported texture.
+
 ## FBX import
 
 File > Import FBX adds every mesh in the file to the scene as its own
@@ -171,4 +204,5 @@ imports FBX files written by Blender (`tests/fixtures`).
 - `src/app.rs` - state, menus, tool panel, files
 - `src/viewport.rs` - 3D view, picking, modal transforms
 - `src/uv_editor.rs` - UV editor
+- `src/paint.rs`, `src/pixels.rs` - paint tab and its pixel operations (unit tested)
 - `src/render.rs`, `src/camera.rs` - OpenGL drawing, orbit camera
