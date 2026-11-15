@@ -23,8 +23,16 @@ XDG desktop portal.
 ## Objects and modes
 
 The scene is a list of named objects, shown at the top of the right panel.
-Click a name (or click the object in the viewport) to select it; the box
+Click a name (or click the object in the viewport) to select it; the eye
 next to it hides or shows it.
+
+**Groups by name**: objects whose names share the part before the first
+underscore are folded into a group named after it: `Doodad_Barrel_1` and
+`Doodad_Crate` both sit under "Doodad". (A prefix used by only one object
+does not make a group.) On a group's row, the arrow unfolds it, the eye
+shows or hides every member, and clicking the name selects them all;
+Shift+click adds the group to the selection. Rename an object to move it
+to another group.
 
 - **Object mode**: transforms move the whole selected object. Adding a mesh
   creates a new object.
@@ -251,6 +259,18 @@ missing) or embedded if "Embed texture in FBX" is ticked.
 
 `cargo test` round-trips exports through the ufbx parser in strict mode and
 imports FBX files written by Blender (`tests/fixtures`).
+
+## Large scenes
+
+Scenes with hundreds of objects are drawn from cached data: each distinct
+mesh is prepared once, unselected and selected objects are kept in two
+buffers on the graphics card, and those are only rebuilt when something in
+them changes. Only the object being edited is rebuilt every frame. The
+object list lays out just the rows in view. Undo keeps up to 200 steps or
+about 256 MB, whichever comes first.
+
+Running with the environment variable `PIXELMESH_PROFILE=1` prints the
+time spent building each frame to the terminal.
 
 ## Code map
 

@@ -22,13 +22,26 @@ impl Batch {
     pub fn point(&mut self, p: Vec3, c: [f32; 4]) {
         self.push(p, Vec3::Y, Vec2::ZERO, c);
     }
-    fn count(&self) -> i32 {
+    pub fn count(&self) -> i32 {
         (self.data.len() / STRIDE) as i32
     }
 }
 
+/// Geometry that rarely changes (the bulk of a big scene). It is uploaded to the
+/// graphics card once and only again when `key` changes.
+#[derive(Clone, Default)]
+pub struct Layer {
+    pub key: u64,
+    pub tris: std::sync::Arc<Batch>,
+    pub lines: std::sync::Arc<Batch>,
+}
+
+pub const LAYERS: usize = 2;
+
 /// Everything needed to draw one frame; built on the UI thread.
 pub struct FrameData {
+    /// Cached layers: unselected objects, and selected objects.
+    pub layers: [Layer; LAYERS],
     pub view_proj: Mat4,
     pub tris: Batch,
     /// Lines that should always be hidden by geometry (grid).
@@ -46,6 +59,14 @@ pub struct Renderer {
     texture: glow::Texture,
     white: glow::Texture,
     tex_version: u64,
+    layers: [GpuLayer; LAYERS],
+}
+
+/// Vertex buffers for one cached layer.
+struct GpuLayer {
+    key: Option<u64>,
+    tris: (glow::VertexArray, glow::Buffer, i32),
+    lines: (glow::VertexArray, glow::Buffer, i32),
 }
 
 const VS: &str = r#"#version 330 core
@@ -114,21 +135,34 @@ impl Renderer {
                 gl.delete_shader(sh);
             }
 
-            let vao = gl.create_vertex_array()?;
-            let vbo = gl.create_buffer()?;
-            gl.bind_vertex_array(Some(vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-            let stride = (STRIDE * 4) as i32;
-            for (loc, size, offset) in [(0, 3, 0), (1, 3, 3), (2, 2, 6), (3, 4, 8)] {
-                gl.enable_vertex_attrib_array(loc);
-                gl.vertex_attrib_pointer_f32(loc, size, glow::FLOAT, false, stride, offset * 4);
+            let (vao, vbo) = Self::make_buffer(gl)?;
+            let mut layers = Vec::new();
+            for _ in 0..LAYERS {
+                let (tv, tb) = Self::make_buffer(gl)?;
+                let (lv, lb) = Self::make_buffer(gl)?;
+                layers.push(GpuLayer { key: None, tris: (tv, tb, 0), lines: (lv, lb, 0) });
             }
-            gl.bind_vertex_array(None);
+            let Ok(layers) = <[GpuLayer; LAYERS]>::try_from(layers) else { return Err("layer setup failed".into()) };
 
             let white = Self::make_texture(gl, 1, 1, &[205, 205, 210, 255])?;
             let texture = Self::make_texture(gl, 1, 1, &[255, 255, 255, 255])?;
-            Ok(Renderer { program, vao, vbo, texture, white, tex_version: 0 })
+            Ok(Renderer { program, vao, vbo, texture, white, tex_version: 0, layers })
         }
+    }
+
+    /// A vertex array + buffer set up for the interleaved vertex format.
+    unsafe fn make_buffer(gl: &glow::Context) -> Result<(glow::VertexArray, glow::Buffer), String> {
+        let vao = gl.create_vertex_array()?;
+        let vbo = gl.create_buffer()?;
+        gl.bind_vertex_array(Some(vao));
+        gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+        let stride = (STRIDE * 4) as i32;
+        for (loc, size, offset) in [(0, 3, 0), (1, 3, 3), (2, 2, 6), (3, 4, 8)] {
+            gl.enable_vertex_attrib_array(loc);
+            gl.vertex_attrib_pointer_f32(loc, size, glow::FLOAT, false, stride, offset * 4);
+        }
+        gl.bind_vertex_array(None);
+        Ok((vao, vbo))
     }
 
     unsafe fn make_texture(gl: &glow::Context, w: u32, h: u32, rgba: &[u8]) -> Result<glow::Texture, String> {
@@ -178,14 +212,33 @@ impl Renderer {
             let point_size = gl.get_uniform_location(self.program, "u_point_size");
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(if frame.texture.is_some() { self.texture } else { self.white }));
-            gl.bind_vertex_array(Some(self.vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vbo));
+            // Re-upload a cached layer only when its contents changed.
+            let bytes_of = |batch: &Batch| std::slice::from_raw_parts(batch.data.as_ptr() as *const u8, batch.data.len() * 4);
+            for (gpu, layer) in self.layers.iter_mut().zip(&frame.layers) {
+                if gpu.key != Some(layer.key) {
+                    for (target, batch) in [(&mut gpu.tris, &layer.tris), (&mut gpu.lines, &layer.lines)] {
+                        gl.bind_buffer(glow::ARRAY_BUFFER, Some(target.1));
+                        gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes_of(batch), glow::STATIC_DRAW);
+                        target.2 = batch.count();
+                    }
+                    gpu.key = Some(layer.key);
+                }
+            }
 
+            // Per-frame geometry goes through one buffer that is refilled for each batch.
+            let (vao, vbo) = (self.vao, self.vbo);
             let draw = |batch: &Batch, prim: u32| {
                 if batch.count() > 0 {
-                    let bytes = std::slice::from_raw_parts(batch.data.as_ptr() as *const u8, batch.data.len() * 4);
-                    gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STREAM_DRAW);
+                    gl.bind_vertex_array(Some(vao));
+                    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                    gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes_of(batch), glow::STREAM_DRAW);
                     gl.draw_arrays(prim, 0, batch.count());
+                }
+            };
+            let draw_cached = |buffer: &(glow::VertexArray, glow::Buffer, i32), prim: u32| {
+                if buffer.2 > 0 {
+                    gl.bind_vertex_array(Some(buffer.0));
+                    gl.draw_arrays(prim, 0, buffer.2);
                 }
             };
 
@@ -193,6 +246,9 @@ impl Renderer {
             gl.uniform_1_i32(mode.as_ref(), 0);
             gl.enable(glow::POLYGON_OFFSET_FILL);
             gl.polygon_offset(1.0, 1.0);
+            for layer in &self.layers {
+                draw_cached(&layer.tris, glow::TRIANGLES);
+            }
             draw(&frame.tris, glow::TRIANGLES);
             gl.disable(glow::POLYGON_OFFSET_FILL);
 
@@ -200,6 +256,9 @@ impl Renderer {
             gl.enable(glow::BLEND);
             gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
             draw(&frame.grid, glow::LINES);
+            for layer in &self.layers {
+                draw_cached(&layer.lines, glow::LINES);
+            }
             draw(&frame.lines, glow::LINES);
             gl.uniform_1_f32(point_size.as_ref(), 7.0);
             draw(&frame.points, glow::POINTS);
@@ -218,6 +277,12 @@ impl Renderer {
             gl.delete_buffer(self.vbo);
             gl.delete_texture(self.texture);
             gl.delete_texture(self.white);
+            for layer in &self.layers {
+                for (vao, vbo, _) in [layer.tris, layer.lines] {
+                    gl.delete_vertex_array(vao);
+                    gl.delete_buffer(vbo);
+                }
+            }
         }
     }
 }

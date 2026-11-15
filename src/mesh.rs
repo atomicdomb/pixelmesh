@@ -33,7 +33,30 @@ impl EdgeRing {
     }
 }
 
+/// Cheap order-sensitive hash step (the FxHash mixer).
+pub fn mix(h: u64, word: u64) -> u64 {
+    (h.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95)
+}
+
 impl Mesh {
+    /// A hash of the whole mesh: changes whenever any position, face or UV changes.
+    /// Fast enough to compute for every object every frame; used to reuse cached draw data.
+    pub fn fingerprint(&self) -> u64 {
+        let mut h = mix(self.positions.len() as u64, self.faces.len() as u64);
+        for p in &self.positions {
+            h = mix(h, (p.x.to_bits() as u64) << 32 | p.y.to_bits() as u64);
+            h = mix(h, p.z.to_bits() as u64);
+        }
+        for f in &self.faces {
+            h = mix(h, f.verts.len() as u64);
+            for (v, uv) in f.verts.iter().zip(&f.uvs) {
+                h = mix(h, *v as u64);
+                h = mix(h, (uv.x.to_bits() as u64) << 32 | uv.y.to_bits() as u64);
+            }
+        }
+        h
+    }
+
     // ---------------------------------------------------------------- queries
 
     pub fn face_normal(&self, f: usize) -> Vec3 {

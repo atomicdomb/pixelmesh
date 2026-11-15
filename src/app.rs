@@ -155,6 +155,11 @@ pub struct App {
     redo: Vec<UndoStep>,
     pub left_tab: LeftTab,
     pub paint: crate::paint::Paint,
+    /// Draw data per distinct mesh, and the two cached layers built from it (see `build_frame`).
+    pub geom_cache: std::collections::HashMap<u64, Arc<crate::viewport::ObjGeom>>,
+    pub layers: [crate::render::Layer; crate::render::LAYERS],
+    /// Prefix groups currently unfolded in the object list.
+    pub expanded_groups: BTreeSet<String>,
     /// Interface icons, uploaded once at start-up.
     pub icons: std::collections::HashMap<pixelmesh::icons::Icon, egui::TextureHandle>,
 
@@ -212,6 +217,9 @@ impl App {
             redo: Vec::new(),
             left_tab: LeftTab::Uv,
             paint: crate::paint::Paint::default(),
+            geom_cache: std::collections::HashMap::new(),
+            layers: Default::default(),
+            expanded_groups: BTreeSet::new(),
             icons: {
                 // Icons come from assets/icons.png (compiled into the program); anything
                 // that image does not contain falls back to the built-in drawing.
@@ -532,8 +540,16 @@ impl App {
 
     fn push_step(&mut self, step: UndoStep) {
         self.undo.push(step);
-        if self.undo.len() > 200 {
-            self.undo.remove(0);
+        // Keep at most 200 steps, and no more than about 256 MB: a snapshot of a big scene is not small.
+        let size = |s: &UndoStep| match s {
+            UndoStep::Pixels { rgba, .. } => rgba.len(),
+            UndoStep::Scene(snap) => snap.objects.iter().map(|o| {
+                o.mesh.positions.len() * 12 + o.mesh.faces.iter().map(|f| 48 + f.verts.len() * 12).sum::<usize>()
+            }).sum(),
+        };
+        let mut total: usize = self.undo.iter().map(size).sum();
+        while self.undo.len() > 200 || (total > 256 << 20 && self.undo.len() > 4) {
+            total -= size(&self.undo.remove(0));
         }
         self.redo.clear();
     }
@@ -1359,6 +1375,25 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // PIXELMESH_PROFILE=1 prints how long building each frame takes (and repaints continuously).
+        let profile_start = std::time::Instant::now();
+        let profiling = std::env::var_os("PIXELMESH_PROFILE").is_some();
+        if profiling {
+            ctx.request_repaint();
+        }
+        let _report = Defer(Some(move || {
+            if profiling {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static FRAMES: AtomicU64 = AtomicU64::new(0);
+                static MICROS: AtomicU64 = AtomicU64::new(0);
+                let total = MICROS.fetch_add(profile_start.elapsed().as_micros() as u64, Ordering::Relaxed);
+                let n = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+                if n % 20 == 0 {
+                    eprintln!("ui: {:.2} ms/frame over the last 20 frames", (total + profile_start.elapsed().as_micros() as u64) as f64 / 20_000.0);
+                    MICROS.store(0, Ordering::Relaxed);
+                }
+            }
+        }));
         self.poll_texture(&ctx);
         self.shortcuts(&ctx);
 
@@ -1407,6 +1442,17 @@ impl eframe::App for App {
     fn on_exit(&mut self, gl: Option<&eframe::glow::Context>) {
         if let (Some(gl), Some(r)) = (gl, &self.renderer) {
             r.lock().unwrap().destroy(gl);
+        }
+    }
+}
+
+/// Runs a closure when dropped (end of scope).
+struct Defer<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
         }
     }
 }

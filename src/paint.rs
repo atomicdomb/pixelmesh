@@ -101,6 +101,8 @@ pub struct Paint {
     /// Outline of the selection on the pixel grid, rebuilt when the selection changes.
     outline: Vec<[(i32, i32); 2]>,
     outline_dirty: bool,
+    /// Distinct UV edges of the whole scene for the overlay, with the scene hash they were built from.
+    uv_edges: (u64, Vec<[Vec2; 2]>),
 }
 
 impl Default for Paint {
@@ -120,6 +122,7 @@ impl Default for Paint {
             selection: None,
             outline: Vec::new(),
             outline_dirty: false,
+            uv_edges: (0, Vec::new()),
         }
     }
 }
@@ -547,20 +550,42 @@ impl App {
         }
         painter.rect_stroke(sheet, 0.0, Stroke::new(1.0, Color32::from_gray(150)), egui::StrokeKind::Outside);
 
-        // ---- UV overlay: every visible object's faces; the ones shown in the UV tab are brighter
+        // ---- UV overlay: every visible object's UV edges; the faces shown in the UV tab are brighter
         if self.paint.show_uv {
-            let active = self.active_faces();
-            for (oi, obj) in self.objects.iter().enumerate() {
-                if !obj.visible {
-                    continue;
+            // Many objects share the same spots on a sprite sheet, so the overlay is the set of
+            // distinct UV edges, rebuilt only when some mesh changes.
+            let key = self.objects.iter().filter(|o| o.visible).fold(7, |h, o| pixelmesh::mesh::mix(h, o.mesh.fingerprint()));
+            if self.paint.uv_edges.0 != key {
+                let mut unique: std::collections::HashSet<[i32; 4]> = std::collections::HashSet::new();
+                let q = |v: Vec2| ((v.x * 65536.0).round() as i32, (v.y * 65536.0).round() as i32);
+                for obj in self.objects.iter().filter(|o| o.visible) {
+                    for face in &obj.mesh.faces {
+                        for k in 0..face.uvs.len() {
+                            let (a, b) = (q(face.uvs[k]), q(face.uvs[(k + 1) % face.uvs.len()]));
+                            let (a, b) = if a <= b { (a, b) } else { (b, a) };
+                            unique.insert([a.0, a.1, b.0, b.1]);
+                        }
+                    }
                 }
-                for (fi, face) in obj.mesh.faces.iter().enumerate() {
-                    let pts: Vec<Pos2> = face.uvs.iter().map(|&uv| view.to_screen(uv)).collect();
-                    let strong = oi == self.active && active.contains(&fi);
+                let edges = unique.into_iter().map(|e| [Vec2::new(e[0] as f32, e[1] as f32) / 65536.0, Vec2::new(e[2] as f32, e[3] as f32) / 65536.0]).collect();
+                self.paint.uv_edges = (key, edges);
+            }
+            let visible = rect.expand(2.0);
+            let under = Stroke::new(3.0, Color32::from_rgba_unmultiplied(0, 0, 0, 50));
+            let over = Stroke::new(1.0, Color32::from_rgba_unmultiplied(170, 205, 255, 150));
+            for [a, b] in &self.paint.uv_edges.1 {
+                let (a, b) = (view.to_screen(*a), view.to_screen(*b));
+                if visible.intersects(Rect::from_two_pos(a, b)) {
                     // Dark underlay so the line reads on light and dark pixels alike.
-                    painter.add(egui::Shape::closed_line(pts.clone(), Stroke::new(3.0, Color32::from_rgba_unmultiplied(0, 0, 0, if strong { 110 } else { 50 }))));
-                    let line = if strong { Color32::from_rgb(255, 170, 60) } else { Color32::from_rgba_unmultiplied(170, 205, 255, 150) };
-                    painter.add(egui::Shape::closed_line(pts, Stroke::new(1.0, line)));
+                    painter.line_segment([a, b], under);
+                    painter.line_segment([a, b], over);
+                }
+            }
+            if let Some(obj) = self.objects.get(self.active).filter(|o| o.visible) {
+                for fi in self.active_faces() {
+                    let pts: Vec<Pos2> = obj.mesh.faces[fi].uvs.iter().map(|&uv| view.to_screen(uv)).collect();
+                    painter.add(egui::Shape::closed_line(pts.clone(), Stroke::new(3.0, Color32::from_rgba_unmultiplied(0, 0, 0, 110))));
+                    painter.add(egui::Shape::closed_line(pts, Stroke::new(1.0, Color32::from_rgb(255, 170, 60))));
                 }
             }
         }

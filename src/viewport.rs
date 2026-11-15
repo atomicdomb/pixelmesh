@@ -2,11 +2,11 @@
 //! move/rotate/scale and frame building.
 
 use crate::app::{edge_key, App, Edge, SelMode, SelectTool};
-use crate::render::{Batch, FrameData};
+use crate::render::{Batch, FrameData, Layer};
 use eframe::egui::{self, Color32, Key, PointerButton, Pos2, Sense, Stroke};
 use eframe::egui_glow;
 use glam::{Quat, Vec3};
-use pixelmesh::mesh::{EdgeRing, Mesh};
+use pixelmesh::mesh::{mix, EdgeRing, Mesh};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -79,6 +79,30 @@ impl LoopCut {
 struct Preview {
     lines: Vec<[Vec3; 2]>,
     points: Vec<Vec3>,
+}
+
+/// Ready-to-draw data for one mesh, reused for as long as the mesh does not change
+/// (and shared by objects with identical meshes).
+pub struct ObjGeom {
+    /// Triangle vertices in the renderer's interleaved format, untinted.
+    tris: Vec<f32>,
+    edges: Vec<[Vec3; 2]>,
+}
+
+impl ObjGeom {
+    fn build(mesh: &Mesh) -> Self {
+        let mut batch = Batch::default();
+        for (fi, face) in mesh.faces.iter().enumerate() {
+            let normal = mesh.face_normal(fi);
+            for tri in mesh.triangulate(fi) {
+                for c in tri {
+                    batch.push(mesh.positions[face.verts[c] as usize], normal, face.uvs[c], [0.0; 4]);
+                }
+            }
+        }
+        let edges = mesh.edges().into_iter().map(|(a, b)| [mesh.positions[a as usize], mesh.positions[b as usize]]).collect();
+        ObjGeom { tris: batch.data, edges }
+    }
 }
 
 /// A selection of whatever the current mode selects.
@@ -781,7 +805,10 @@ impl App {
         }
     }
 
-    fn build_frame(&self, rect: egui::Rect) -> FrameData {
+    /// Draw data for this frame. Whole objects come from a per-mesh cache and are
+    /// grouped into two layers that are only rebuilt (and re-uploaded) when their
+    /// contents change; only the object being edited is built from scratch.
+    fn build_frame(&mut self, rect: egui::Rect) -> FrameData {
         let mut tris = Batch::default();
         let mut grid = Batch::default();
         let mut lines = Batch::default();
@@ -797,16 +824,58 @@ impl App {
         grid.line(Vec3::new(-8.0, 0.0, 0.0), Vec3::new(8.0, 0.0, 0.0), [0.9, 0.3, 0.3, 0.7]);
         grid.line(Vec3::new(0.0, 0.0, -8.0), Vec3::new(0.0, 0.0, 8.0), [0.3, 0.5, 0.95, 0.7]);
 
-        let active_verts = self.active_verts();
-        let inv_view = self.camera.view().inverse();
-        let (cam_right, cam_up) = (inv_view.transform_vector3(Vec3::X), inv_view.transform_vector3(Vec3::Y));
-        for (oi, obj) in self.objects.iter().enumerate() {
-            if !obj.visible {
+        let object_mode = self.sel_mode == SelMode::Object;
+        // Which objects are drawn from the cache: everything except the one being edited.
+        let edited = (!object_mode).then_some(self.active);
+        let mut in_use: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut cached: Vec<(usize, u64)> = Vec::new();
+        for (i, obj) in self.objects.iter().enumerate() {
+            if !obj.visible || edited == Some(i) {
                 continue;
             }
+            let fp = obj.mesh.fingerprint();
+            in_use.insert(fp);
+            cached.push((i, fp));
+            self.geom_cache.entry(fp).or_insert_with(|| Arc::new(ObjGeom::build(&obj.mesh)));
+        }
+        self.geom_cache.retain(|fp, _| in_use.contains(fp));
+
+        // Layer 0: unselected objects, dark outlines. Layer 1: selected objects, highlighted outlines.
+        let mut keys = [mix(1, 0), mix(2, self.active as u64)];
+        for &(i, fp) in &cached {
+            let layer = (object_mode && self.sel_objects.contains(&i)) as usize;
+            keys[layer] = mix(mix(keys[layer], fp), if layer == 1 && i == self.active { 1 } else { 0 });
+        }
+        for layer in 0..2 {
+            if self.layers[layer].key == keys[layer] {
+                continue;
+            }
+            let (mut lt, mut ll) = (Batch::default(), Batch::default());
+            for &(i, fp) in &cached {
+                if (object_mode && self.sel_objects.contains(&i)) as usize != layer {
+                    continue;
+                }
+                let geom = &self.geom_cache[&fp];
+                lt.data.extend_from_slice(&geom.tris);
+                let colour = match (layer, i == self.active) {
+                    (0, _) => [0.04, 0.04, 0.06, 0.9],
+                    (_, true) => [1.0, 0.8, 0.3, 1.0],
+                    _ => ORANGE,
+                };
+                for [a, b] in &geom.edges {
+                    ll.line(*a, *b, colour);
+                }
+            }
+            self.layers[layer] = Layer { key: keys[layer], tris: Arc::new(lt), lines: Arc::new(ll) };
+        }
+
+        // The object being edited: per-face and per-edge highlights, rebuilt every frame.
+        if let Some(obj) = edited.and_then(|i| self.objects.get(i)).filter(|o| o.visible) {
             let mesh = &obj.mesh;
-            let is_active = oi == self.active;
-            let face_mode = is_active && self.sel_mode == SelMode::Face;
+            let active_verts = self.active_verts();
+            let inv_view = self.camera.view().inverse();
+            let (cam_right, cam_up) = (inv_view.transform_vector3(Vec3::X), inv_view.transform_vector3(Vec3::Y));
+            let face_mode = self.sel_mode == SelMode::Face;
             for (fi, face) in mesh.faces.iter().enumerate() {
                 let normal = mesh.face_normal(fi);
                 let tint = if face_mode && self.sel_faces.contains(&fi) { [1.0, 0.55, 0.1, 0.35] } else { [0.0; 4] };
@@ -816,34 +885,23 @@ impl App {
                     }
                 }
             }
-            let object_mode = self.sel_mode == SelMode::Object;
-            let object_selected = object_mode && self.sel_objects.contains(&oi);
             for (a, b) in mesh.edges() {
-                // Selected objects are outlined whole (the active one brighter); in edit modes only selected edges light up.
-                let selected = object_selected
-                    || (is_active && match self.sel_mode {
-                        SelMode::Object => false,
-                        SelMode::Edge => self.sel_edges.contains(&edge_key(a, b)),
-                        _ => active_verts.contains(&a) && active_verts.contains(&b),
-                    });
-                let c = if !selected {
-                    [0.04, 0.04, 0.06, 0.9]
-                } else if object_mode && is_active {
-                    [1.0, 0.8, 0.3, 1.0]
-                } else {
-                    ORANGE
+                let selected = match self.sel_mode {
+                    SelMode::Edge => self.sel_edges.contains(&edge_key(a, b)),
+                    _ => active_verts.contains(&a) && active_verts.contains(&b),
                 };
-                if selected && !object_mode {
+                let (pa, pb) = (mesh.positions[a as usize], mesh.positions[b as usize]);
+                let c = if selected { ORANGE } else { [0.04, 0.04, 0.06, 0.9] };
+                if selected {
                     // Lines are one pixel wide; redraw selected edges a pixel to each side so they stand out.
-                    let (pa, pb) = (mesh.positions[a as usize], mesh.positions[b as usize]);
                     let px = self.camera.units_per_pixel(rect, (pa + pb) * 0.5);
                     for offset in [cam_right * px, -cam_right * px, cam_up * px, -cam_up * px] {
                         lines.line(pa + offset, pb + offset, c);
                     }
                 }
-                lines.line(mesh.positions[a as usize], mesh.positions[b as usize], c);
+                lines.line(pa, pb, c);
             }
-            if is_active && self.sel_mode == SelMode::Vertex {
+            if self.sel_mode == SelMode::Vertex {
                 for (i, &p) in mesh.positions.iter().enumerate() {
                     let c = if self.sel_verts.contains(&(i as u32)) { ORANGE } else { [0.0, 0.0, 0.0, 1.0] };
                     points.point(p, c);
@@ -857,6 +915,7 @@ impl App {
         }
 
         FrameData {
+            layers: self.layers.clone(),
             view_proj: self.camera.view_proj(rect),
             tris,
             grid,
@@ -1044,7 +1103,11 @@ impl App {
         }
 
         // ---- origin markers: selected objects in object mode, the edited object otherwise
-        let marked: Vec<usize> = if self.sel_mode == SelMode::Object { self.transform_objects() } else { vec![self.active] };
+        let mut marked: Vec<usize> = if self.sel_mode == SelMode::Object { self.transform_objects() } else { vec![self.active] };
+        if marked.len() > 12 {
+            // A crowd of rings says nothing: with many objects selected only the active one is marked.
+            marked.retain(|&i| i == self.active);
+        }
         for i in marked {
             let Some(p) = self.objects.get(i).filter(|o| o.visible).and_then(|o| self.camera.project(rect, o.origin)) else { continue };
             let ring = if self.origin_only && self.sel_mode == SelMode::Object { 6.5 } else { 5.0 };

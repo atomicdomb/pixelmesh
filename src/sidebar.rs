@@ -63,6 +63,18 @@ fn row(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
     });
 }
 
+/// One line of the object list.
+enum ListRow {
+    Group(String),
+    /// Object index, and whether it is shown indented under its group.
+    Object(usize, bool),
+}
+
+/// The part of an object's name before the first underscore: its group.
+pub fn group_prefix(name: &str) -> Option<&str> {
+    name.split_once('_').map(|(prefix, _)| prefix).filter(|p| !p.is_empty())
+}
+
 impl App {
     pub fn icon(&self, icon: Icon) -> egui::TextureId {
         self.icons[&icon].id()
@@ -92,17 +104,6 @@ impl App {
             let text = if !enabled { Color32::from_gray(100) } else if selected { Color32::from_rgb(255, 232, 200) } else { Color32::from_gray(205) };
             painter.text(egui::pos2(rect.center().x, rect.bottom() - 8.0), egui::Align2::CENTER_CENTER, label, egui::FontId::proportional(10.0), text);
         }
-        resp
-    }
-
-    /// A small square icon-only button.
-    fn icon_button(&self, ui: &mut egui::Ui, icon: Icon) -> egui::Response {
-        let (rect, resp) = ui.allocate_exact_size(egui::vec2(22.0, 20.0), Sense::click());
-        if resp.hovered() {
-            ui.painter().rect_filled(rect, 4.0, TILE_HOVER);
-        }
-        let top_left = egui::pos2(rect.left() + 3.0, rect.top() + 2.0);
-        ui.painter().image(self.icon(icon), Rect::from_min_size(top_left, egui::vec2(16.0, 16.0)), Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
         resp
     }
 
@@ -149,45 +150,152 @@ impl App {
             return;
         }
         let object_mode = self.sel_mode == SelMode::Object;
-        let mut clicked = None;
-        let mut toggle_visible = None;
-        for i in 0..self.objects.len() {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                let eye = if self.objects[i].visible { Icon::EyeOpen } else { Icon::EyeClosed };
-                if self.icon_button(ui, eye).on_hover_text("Show / hide").clicked() {
-                    toggle_visible = Some(i);
-                }
-                let obj = &self.objects[i];
-                let mut name = RichText::new(&obj.name);
-                if i == self.active {
-                    name = name.strong();
-                }
-                // In edit modes only the object being edited is highlighted.
-                let selected = if object_mode { self.sel_objects.contains(&i) } else { i == self.active };
-                let count = RichText::new(format!("{} faces", obj.mesh.faces.len())).size(10.5).color(MUTED);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(count);
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center).with_main_justify(true), |ui| {
-                        if ui.selectable_label(selected, name).clicked() {
-                            clicked = Some((i, ui.input(|inp| inp.modifiers.shift || inp.modifiers.command)));
+
+        // Group by prefix: "Doodad_Barrel_3" belongs to "Doodad" when at least one other object does too.
+        let mut members: std::collections::BTreeMap<&str, Vec<usize>> = std::collections::BTreeMap::new();
+        for (i, obj) in self.objects.iter().enumerate() {
+            if let Some(prefix) = group_prefix(&obj.name) {
+                members.entry(prefix).or_default().push(i);
+            }
+        }
+        members.retain(|_, m| m.len() >= 2);
+        // Rows in scene order; a group appears where its first member is.
+        let mut rows: Vec<ListRow> = Vec::new();
+        let mut emitted: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (i, obj) in self.objects.iter().enumerate() {
+            match group_prefix(&obj.name).filter(|p| members.contains_key(p)) {
+                Some(prefix) => {
+                    if emitted.insert(prefix) {
+                        rows.push(ListRow::Group(prefix.to_string()));
+                        if self.expanded_groups.contains(prefix) {
+                            rows.extend(members[prefix].iter().map(|&m| ListRow::Object(m, true)));
                         }
-                    });
-                });
-            });
+                    }
+                }
+                None => rows.push(ListRow::Object(i, false)),
+            }
         }
-        if let Some(i) = toggle_visible {
-            self.objects[i].visible = !self.objects[i].visible;
+
+        enum Click {
+            Object(usize),
+            Group(String),
+            ToggleGroup(String),
+            Eye(Vec<usize>),
         }
-        if let Some((i, toggle)) = clicked {
-            self.set_mode(SelMode::Object);
-            self.select_object(i, toggle);
+        let mut click = None;
+        let row_h = 21.0;
+        // Only the rows in view are laid out, so thousands of objects cost nothing.
+        ui.spacing_mut().item_spacing.y = 1.0;
+        egui::ScrollArea::vertical().id_salt("object-list").max_height(232.0).auto_shrink([false, true]).show_rows(ui, row_h, rows.len(), |ui, range| {
+            for row in &rows[range] {
+                let (rect, resp) = ui.allocate_exact_size(egui::vec2(ui.available_width(), row_h), Sense::click());
+                let x_in = resp.interact_pointer_pos().map(|p| p.x - rect.left());
+                let painter = ui.painter().with_clip_rect(rect);
+                let mid = rect.center().y;
+                match row {
+                    ListRow::Group(name) => {
+                        let ids = &members[name.as_str()];
+                        let open = self.expanded_groups.contains(name);
+                        let selected = if object_mode { ids.iter().filter(|i| self.sel_objects.contains(i)).count() } else { 0 };
+                        let all_selected = object_mode && selected == ids.len();
+                        let fill = if all_selected { Color32::from_rgb(120, 72, 22) } else if resp.hovered() { TILE_HOVER } else { TILE };
+                        painter.rect_filled(rect, 4.0, fill);
+                        // Fold arrow.
+                        let c = egui::pos2(rect.left() + 10.0, mid);
+                        let tri = if open {
+                            vec![c + egui::vec2(-4.0, -2.5), c + egui::vec2(4.0, -2.5), c + egui::vec2(0.0, 3.5)]
+                        } else {
+                            vec![c + egui::vec2(-2.5, -4.0), c + egui::vec2(3.5, 0.0), c + egui::vec2(-2.5, 4.0)]
+                        };
+                        painter.add(egui::Shape::convex_polygon(tri, Color32::from_gray(200), Stroke::NONE));
+                        let visible = ids.iter().any(|&i| self.objects[i].visible);
+                        let eye = if visible { Icon::EyeOpen } else { Icon::EyeClosed };
+                        painter.image(self.icon(eye), Rect::from_min_size(egui::pos2(rect.left() + 21.0, mid - 8.0), egui::vec2(16.0, 16.0)), Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
+                        let note = if selected > 0 && !all_selected { format!("{selected} of {}", ids.len()) } else { format!("{}", ids.len()) };
+                        painter.text(egui::pos2(rect.right() - 6.0, mid), egui::Align2::RIGHT_CENTER, note, egui::FontId::proportional(10.5), if selected > 0 { ACCENT } else { MUTED });
+                        painter.with_clip_rect(rect.with_max_x(rect.right() - 48.0)).text(
+                            egui::pos2(rect.left() + 42.0, mid), egui::Align2::LEFT_CENTER, name, egui::FontId::proportional(13.0), Color32::from_gray(235));
+                        if resp.clicked() {
+                            click = Some(match x_in {
+                                Some(x) if x < 19.0 => Click::ToggleGroup(name.clone()),
+                                Some(x) if x < 40.0 => Click::Eye(ids.clone()),
+                                _ => Click::Group(name.clone()),
+                            });
+                        } else if resp.double_clicked() {
+                            click = Some(Click::ToggleGroup(name.clone()));
+                        }
+                        resp.on_hover_text("Click the arrow to unfold  ·  click the name to select the whole group  ·  the eye shows or hides it");
+                    }
+                    ListRow::Object(i, indented) => {
+                        let obj = &self.objects[*i];
+                        let indent = if *indented { 14.0 } else { 0.0 };
+                        // In edit modes only the object being edited is highlighted.
+                        let selected = if object_mode { self.sel_objects.contains(i) } else { *i == self.active };
+                        if selected {
+                            painter.rect_filled(rect, 4.0, Color32::from_rgb(150, 88, 24));
+                        } else if resp.hovered() {
+                            painter.rect_filled(rect, 4.0, TILE_HOVER);
+                        }
+                        let eye = if obj.visible { Icon::EyeOpen } else { Icon::EyeClosed };
+                        painter.image(self.icon(eye), Rect::from_min_size(egui::pos2(rect.left() + 3.0 + indent, mid - 8.0), egui::vec2(16.0, 16.0)), Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)), Color32::WHITE);
+                        painter.text(egui::pos2(rect.right() - 6.0, mid), egui::Align2::RIGHT_CENTER, format!("{} faces", obj.mesh.faces.len()), egui::FontId::proportional(10.5), if selected { Color32::from_rgb(255, 226, 180) } else { MUTED });
+                        let colour = if *i == self.active { Color32::WHITE } else { Color32::from_gray(210) };
+                        // Long names are cut off at the face count instead of pushing the panel wider.
+                        painter.with_clip_rect(rect.with_max_x(rect.right() - 58.0)).text(
+                            egui::pos2(rect.left() + 24.0 + indent, mid), egui::Align2::LEFT_CENTER, &obj.name, egui::FontId::proportional(13.0), colour);
+                        if resp.clicked() {
+                            click = Some(match x_in {
+                                Some(x) if x < 22.0 + indent => Click::Eye(vec![*i]),
+                                _ => Click::Object(*i),
+                            });
+                        }
+                        if resp.hovered() && obj.name.len() > 18 {
+                            resp.on_hover_text(&obj.name);
+                        }
+                    }
+                }
+            }
+        });
+        ui.spacing_mut().item_spacing.y = 5.0;
+
+        let extend = ui.input(|inp| inp.modifiers.shift || inp.modifiers.command);
+        match click {
+            Some(Click::Object(i)) => {
+                self.set_mode(SelMode::Object);
+                self.select_object(i, extend);
+            }
+            Some(Click::Group(name)) => {
+                let ids: Vec<usize> = self.objects.iter().enumerate().filter(|(_, o)| group_prefix(&o.name) == Some(name.as_str())).map(|(i, _)| i).collect();
+                self.set_mode(SelMode::Object);
+                if !extend {
+                    self.sel_objects.clear();
+                }
+                self.sel_objects.extend(&ids);
+                if let Some(&first) = ids.first() {
+                    self.set_active(first);
+                }
+            }
+            Some(Click::ToggleGroup(name)) => {
+                if !self.expanded_groups.remove(&name) {
+                    self.expanded_groups.insert(name);
+                }
+            }
+            Some(Click::Eye(ids)) => {
+                // Hide if anything is showing, otherwise show.
+                let show = !ids.iter().any(|&i| self.objects[i].visible);
+                for i in ids {
+                    self.objects[i].visible = show;
+                }
+            }
+            None => {}
         }
+
         let active = self.active;
         if let Some(obj) = self.objects.get_mut(active) {
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Name").color(MUTED));
-                ui.add(egui::TextEdit::singleline(&mut obj.name).desired_width(f32::INFINITY));
+                ui.add(egui::TextEdit::singleline(&mut obj.name).desired_width(f32::INFINITY))
+                    .on_hover_text("Objects whose names share the part before the first underscore are grouped: Doodad_Barrel and Doodad_Crate both go under \"Doodad\"");
             });
         }
         ui.horizontal(|ui| {
@@ -203,7 +311,7 @@ impl App {
             }
             let can_merge = object_mode && self.sel_objects.len() >= 2;
             if ui.add_enabled(can_merge, egui::Button::new("Merge").small())
-                .on_hover_text("Join the selected objects into the active (bold) one  ·  Ctrl+J")
+                .on_hover_text("Join the selected objects into the active one  ·  Ctrl+J")
                 .on_disabled_hover_text("Select two or more objects first (Shift+click)")
                 .clicked()
             {
