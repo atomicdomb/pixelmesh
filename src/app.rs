@@ -55,11 +55,45 @@ pub struct Object {
     /// rotated; this records by how much, so it can be shown, edited and exported.
     #[serde(default)]
     pub rotation: Vec3,
+    /// Mirror modifier: reflect the mesh across the plane through the origin facing
+    /// the object's own X / Y / Z axis. Shown and exported, but not part of `mesh`.
+    #[serde(default)]
+    pub mirror: [bool; 3],
 }
 
 impl Object {
     pub fn new(name: impl Into<String>, mesh: Mesh) -> Self {
-        Object { name: name.into(), mesh, visible: true, origin: Vec3::ZERO, rotation: Vec3::ZERO }
+        Object { name: name.into(), mesh, visible: true, origin: Vec3::ZERO, rotation: Vec3::ZERO, mirror: [false; 3] }
+    }
+
+    pub fn has_mirror(&self) -> bool {
+        self.mirror.iter().any(|m| *m)
+    }
+
+    /// The mesh as it is shown and exported: with the mirror modifier applied.
+    pub fn display_mesh(&self) -> std::borrow::Cow<'_, Mesh> {
+        if !self.has_mirror() {
+            return std::borrow::Cow::Borrowed(&self.mesh);
+        }
+        let q = pixelmesh::xform::euler_quat(self.rotation);
+        let mut mesh = self.mesh.clone();
+        for (axis, on) in [Vec3::X, Vec3::Y, Vec3::Z].into_iter().zip(self.mirror) {
+            if on {
+                mesh = mesh.mirrored(self.origin, q * axis, 1e-4);
+            }
+        }
+        std::borrow::Cow::Owned(mesh)
+    }
+
+    /// Changes whenever `display_mesh` would.
+    pub fn display_key(&self) -> u64 {
+        use pixelmesh::mesh::mix;
+        let fp = self.mesh.fingerprint();
+        if !self.has_mirror() {
+            return fp;
+        }
+        let bits = self.mirror.iter().enumerate().fold(0u64, |b, (i, on)| b | (*on as u64) << i);
+        [self.origin, self.rotation].iter().flat_map(|v| v.to_array()).fold(mix(fp, bits + 1), |h, c| mix(h, c.to_bits() as u64))
     }
 
     pub fn bounds(&self) -> Option<(Vec3, Vec3)> {
@@ -228,6 +262,8 @@ impl App {
                     let size = pixelmesh::icons::SIZE as usize;
                     let px = atlas.as_ref()
                         .and_then(|a| pixelmesh::icons::from_atlas(a.as_raw(), a.width(), a.height(), icon))
+                        // An empty cell means the image predates this icon: use the built-in drawing.
+                        .filter(|px| px.chunks_exact(4).any(|p| p[3] != 0))
                         .unwrap_or_else(|| pixelmesh::icons::pixels(icon));
                     let img = egui::ColorImage::from_rgba_unmultiplied([size, size], &px);
                     (icon, cc.egui_ctx.load_texture(format!("icon-{icon:?}"), img, egui::TextureOptions::NEAREST))
@@ -372,6 +408,21 @@ impl App {
         self.status = "Origin moved (geometry unchanged).".into();
     }
 
+    /// Make the active object's mirror permanent: the mirrored half becomes real, editable geometry.
+    pub fn apply_mirror(&mut self) {
+        let Some(obj) = self.objects.get(self.active).filter(|o| o.has_mirror()) else {
+            self.status = "This object has no mirror to apply.".into();
+            return;
+        };
+        let baked = obj.display_mesh().into_owned();
+        self.push_undo();
+        let obj = &mut self.objects[self.active];
+        obj.mesh = baked;
+        obj.mirror = [false; 3];
+        self.clear_selection();
+        self.status = "Mirror applied: both halves are now ordinary geometry.".into();
+    }
+
     /// Join every selected object into the active one.
     pub fn merge_selected(&mut self) {
         if self.sel_mode != SelMode::Object || self.sel_objects.len() < 2 {
@@ -381,8 +432,12 @@ impl App {
         let target = if self.sel_objects.contains(&self.active) { self.active } else { *self.sel_objects.iter().next().unwrap() };
         self.push_undo();
         let others: Vec<usize> = self.sel_objects.iter().copied().filter(|&i| i != target).collect();
+        // Mirror modifiers are baked first: each object goes in the way it looks.
+        let baked = self.objects[target].display_mesh().into_owned();
+        self.objects[target].mesh = baked;
+        self.objects[target].mirror = [false; 3];
         for &i in &others {
-            let mesh = self.objects[i].mesh.clone();
+            let mesh = self.objects[i].display_mesh().into_owned();
             self.objects[target].mesh.append(&mesh);
         }
         for &i in others.iter().rev() {
@@ -963,9 +1018,11 @@ impl App {
         let tex_name = self.texture.as_ref()
             .and_then(|t| t.path.file_name().and_then(|n| n.to_str()).map(str::to_string));
         // Objects without faces would only produce empty nodes.
-        let objects: Vec<fbx::FbxObject> = self.objects.iter()
-            .filter(|o| !o.mesh.faces.is_empty())
-            .map(|o| fbx::FbxObject { name: &o.name, mesh: &o.mesh, origin: o.origin, rotation: o.rotation })
+        // Mirror modifiers are applied in the exported geometry.
+        let meshes: Vec<std::borrow::Cow<Mesh>> = self.objects.iter().map(|o| o.display_mesh()).collect();
+        let objects: Vec<fbx::FbxObject> = self.objects.iter().zip(&meshes)
+            .filter(|(o, _)| !o.mesh.faces.is_empty())
+            .map(|(o, mesh)| fbx::FbxObject { name: &o.name, mesh, origin: o.origin, rotation: o.rotation })
             .collect();
         if objects.is_empty() {
             self.status = "Nothing to export: the scene has no faces.".into();

@@ -1028,6 +1028,37 @@ impl Mesh {
         created
     }
 
+    /// This mesh plus its reflection in the plane through `point` with the given
+    /// normal. Vertices lying on the plane (within `eps`) are shared by both
+    /// halves, so the seam is welded; faces lying wholly in the plane are not doubled.
+    pub fn mirrored(&self, point: Vec3, normal: Vec3, eps: f32) -> Mesh {
+        let n = normal.normalize_or_zero();
+        if n == Vec3::ZERO {
+            return self.clone();
+        }
+        let mut out = self.clone();
+        let twin: Vec<u32> = self.positions.iter().enumerate().map(|(i, &p)| {
+            let d = (p - point).dot(n);
+            if d.abs() <= eps {
+                i as u32
+            } else {
+                out.positions.push(p - 2.0 * d * n);
+                out.positions.len() as u32 - 1
+            }
+        }).collect();
+        for face in &self.faces {
+            if face.verts.iter().all(|&v| twin[v as usize] == v) {
+                continue;
+            }
+            // A reflection turns faces inside out, so the copy is wound the other way.
+            out.faces.push(Face {
+                verts: face.verts.iter().rev().map(|&v| twin[v as usize]).collect(),
+                uvs: face.uvs.iter().rev().copied().collect(),
+            });
+        }
+        out
+    }
+
     pub fn flip_faces(&mut self, faces: &BTreeSet<usize>) {
         for &f in faces {
             self.faces[f].verts.reverse();
@@ -1425,6 +1456,30 @@ mod tests {
         assert_eq!((m.faces.len(), m.positions.len()), (11, 18));
         assert!(is_closed(&m) && normals_point_out(&m));
         assert!(m.faces.iter().all(|f| f.verts.len() == f.uvs.len()));
+    }
+
+    #[test]
+    fn mirror_welds_the_seam() {
+        // Half a box: a unit cube with its -X side removed, mirrored across the plane of that side.
+        let mut half = Mesh::cube();
+        let open_side: BTreeSet<usize> = (0..6).filter(|&f| half.face_normal(f).x < -0.9).collect();
+        half.delete_faces(&open_side);
+        assert!(!is_closed(&half));
+        let whole = half.mirrored(Vec3::new(-0.5, 0.0, 0.0), Vec3::X, 1e-4);
+        assert_eq!((whole.faces.len(), whole.positions.len()), (10, 12)); // 4 seam vertices shared
+        assert!(is_closed(&whole));
+        assert!((volume(&whole) - 2.0).abs() < 1e-5);
+        assert!(whole.positions.iter().any(|p| (p.x + 1.5).abs() < 1e-6));
+        // UVs come along unchanged.
+        assert!(whole.faces.iter().all(|f| f.verts.len() == f.uvs.len()));
+        // A face lying in the mirror plane is not duplicated.
+        let plane = Mesh::plane().mirrored(Vec3::ZERO, Vec3::Y, 1e-4);
+        assert_eq!((plane.faces.len(), plane.positions.len()), (1, 4));
+        // Mirroring twice (two axes) gives four copies.
+        let quarter = Mesh::plane().translated(Vec3::new(1.0, 0.0, 1.0));
+        let four = quarter.mirrored(Vec3::ZERO, Vec3::X, 1e-4).mirrored(Vec3::ZERO, Vec3::Z, 1e-4);
+        assert_eq!(four.faces.len(), 4);
+        assert!((0..4).all(|f| four.face_normal(f).abs_diff_eq(Vec3::Y, 1e-6)));
     }
 
     #[test]

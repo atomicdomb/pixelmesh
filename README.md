@@ -92,6 +92,26 @@ centre of their base.
 Origin and rotation are written to FBX as each model's position and
 rotation, and read back on import.
 
+## Mirror
+
+The Mirror card adds a live mirror to the active object: turn on X, Y or Z
+(or several) and a reflected copy appears on the other side of the
+object's **origin**, along that axis of the object.
+
+- The mirror follows every edit. In an edit mode the mirrored half is
+  tinted blue and cannot be selected; you work on the real half.
+- Vertices lying on the mirror plane are shared by both halves, so the seam
+  is welded. Model one half with its open side on the plane.
+- Put the plane where you need it by moving the origin: the Origin tile, or
+  "Origin to Selection" with the seam's face or vertices selected.
+- Exported FBX files contain the mirrored result. Merging objects bakes
+  their mirrors first.
+- **Apply** makes the mirror permanent: the mirrored half becomes ordinary
+  geometry and the mirror is switched off.
+
+The mirrored half uses the same UVs as the original, so both sides show
+the same part of the texture.
+
 ## Moving things
 
 - **Arrows**: drag the red / green / blue arrow to move the selection along

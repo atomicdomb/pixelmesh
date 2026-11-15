@@ -576,7 +576,7 @@ impl App {
                 // Nearest visible object under the cursor becomes the active one.
                 let hit = self.objects.iter().enumerate()
                     .filter(|(_, o)| o.visible)
-                    .filter_map(|(i, o)| o.mesh.raycast(origin, dir).map(|(_, t)| (i, t)))
+                    .filter_map(|(i, o)| o.display_mesh().raycast(origin, dir).map(|(_, t)| (i, t)))
                     .min_by(|a, b| a.1.total_cmp(&b.1));
                 match hit {
                     Some((i, _)) => self.select_object(i, additive),
@@ -672,14 +672,14 @@ impl App {
         match self.sel_mode {
             SelMode::Object => {
                 for (i, obj) in self.objects.iter().enumerate() {
-                    if obj.visible && obj.mesh.positions.iter().any(|&p| self.camera.project(rect, p).is_some_and(&inside)) {
+                    if obj.visible && obj.display_mesh().positions.iter().any(|&p| self.camera.project(rect, p).is_some_and(&inside)) {
                         hits.objects.insert(i);
                     }
                 }
                 if let Some((o, d)) = centre_ray {
                     let nearest = self.objects.iter().enumerate()
                         .filter(|(_, obj)| obj.visible)
-                        .filter_map(|(i, obj)| obj.mesh.raycast(o, d).map(|(_, t)| (i, t)))
+                        .filter_map(|(i, obj)| obj.display_mesh().raycast(o, d).map(|(_, t)| (i, t)))
                         .min_by(|a, b| a.1.total_cmp(&b.1));
                     hits.objects.extend(nearest.map(|(i, _)| i));
                 }
@@ -779,7 +779,7 @@ impl App {
             SelMode::Object => {
                 let hit = self.objects.iter().enumerate()
                     .filter(|(_, o)| o.visible)
-                    .filter_map(|(i, o)| o.mesh.raycast(origin, dir).map(|(_, t)| (i, t)))
+                    .filter_map(|(i, o)| o.display_mesh().raycast(origin, dir).map(|(_, t)| (i, t)))
                     .min_by(|a, b| a.1.total_cmp(&b.1));
                 if let Some((i, _)) = hit {
                     if !self.sel_objects.contains(&i) {
@@ -833,10 +833,10 @@ impl App {
             if !obj.visible || edited == Some(i) {
                 continue;
             }
-            let fp = obj.mesh.fingerprint();
+            let fp = obj.display_key();
             in_use.insert(fp);
             cached.push((i, fp));
-            self.geom_cache.entry(fp).or_insert_with(|| Arc::new(ObjGeom::build(&obj.mesh)));
+            self.geom_cache.entry(fp).or_insert_with(|| Arc::new(ObjGeom::build(&obj.display_mesh())));
         }
         self.geom_cache.retain(|fp, _| in_use.contains(fp));
 
@@ -900,6 +900,22 @@ impl App {
                     }
                 }
                 lines.line(pa, pb, c);
+            }
+            // The mirrored half follows along while editing, but is not itself editable.
+            if obj.has_mirror() {
+                let full = obj.display_mesh();
+                for (fi, face) in full.faces.iter().enumerate().skip(mesh.faces.len()) {
+                    let normal = full.face_normal(fi);
+                    for tri in full.triangulate(fi) {
+                        for c in tri {
+                            tris.push(full.positions[face.verts[c] as usize], normal, face.uvs[c], [0.25, 0.4, 0.7, 0.18]);
+                        }
+                    }
+                    for k in 0..face.verts.len() {
+                        let (a, b) = (face.verts[k], face.verts[(k + 1) % face.verts.len()]);
+                        lines.line(full.positions[a as usize], full.positions[b as usize], [0.3, 0.5, 0.95, 0.6]);
+                    }
+                }
             }
             if self.sel_mode == SelMode::Vertex {
                 for (i, &p) in mesh.positions.iter().enumerate() {

@@ -138,6 +138,7 @@ impl App {
             card(ui, "SELECT", |ui| self.select_card(ui));
             card(ui, "ADD MESH", |ui| self.add_card(ui));
             card(ui, "TRANSFORM", |ui| self.transform_card(ui));
+            card(ui, "MIRROR", |ui| self.mirror_card(ui));
             card(ui, "MESH", |ui| self.mesh_card(ui));
             card(ui, "UV MAPPING", |ui| self.uv_card(ui));
             card(ui, "TEXTURE", |ui| self.texture_card(ui, &ctx));
@@ -460,6 +461,43 @@ impl App {
                     self.set_origin(OriginTo::Selection);
                 }
             });
+        }
+    }
+
+    fn mirror_card(&mut self, ui: &mut egui::Ui) {
+        let w = tile_width(ui, 4);
+        let active = self.active;
+        let Some(mirror) = self.objects.get(active).map(|o| o.mirror) else {
+            ui.label(RichText::new("No object.").color(MUTED));
+            return;
+        };
+        let mut toggle = None;
+        let mut apply = false;
+        row(ui, |ui| {
+            for (axis, label) in ["Mirror X", "Mirror Y", "Mirror Z"].into_iter().enumerate() {
+                if self.tile(ui, Icon::Mirror, label, mirror[axis], w)
+                    .on_hover_text("Show a mirrored copy of the active object across its origin, along this axis of the object. It updates as you edit, welds where the halves meet, and is included when exporting.")
+                    .clicked()
+                {
+                    toggle = Some(axis);
+                }
+            }
+            ui.add_enabled_ui(mirror.iter().any(|m| *m), |ui| {
+                apply = self.tile(ui, Icon::Apply, "Apply", false, w)
+                    .on_hover_text("Make the mirror permanent: the mirrored half becomes ordinary geometry you can edit")
+                    .on_disabled_hover_text("Turn on a mirror axis first")
+                    .clicked();
+            });
+        });
+        if let Some(axis) = toggle {
+            self.push_undo();
+            self.objects[active].mirror[axis] = !mirror[axis];
+        }
+        if apply {
+            self.apply_mirror();
+        }
+        if mirror.iter().any(|m| *m) {
+            ui.label(RichText::new("Mirrors across the origin (orange ring).").size(10.5).color(MUTED));
         }
     }
 

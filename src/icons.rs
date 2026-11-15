@@ -25,9 +25,11 @@ pub enum Icon {
     Pencil, Eraser, Fill, Picker, Line, Rect,
     // New icons go at the end so the positions in assets/icons.png never shift.
     Wand,
+    Mirror,
+    Apply,
 }
 
-pub const ALL: [Icon; 45] = [
+pub const ALL: [Icon; 47] = [
     Icon::Object, Icon::Vertex, Icon::Edge, Icon::Face,
     Icon::Click, Icon::BoxSelect, Icon::CircleSelect,
     Icon::Plane, Icon::Cube, Icon::Cylinder, Icon::Cone, Icon::Sphere,
@@ -37,7 +39,7 @@ pub const ALL: [Icon; 45] = [
     Icon::New, Icon::Load, Icon::Save, Icon::Export,
     Icon::EyeOpen, Icon::EyeClosed,
     Icon::Pencil, Icon::Eraser, Icon::Fill, Icon::Picker, Icon::Line, Icon::Rect,
-    Icon::Wand,
+    Icon::Wand, Icon::Mirror, Icon::Apply,
 ];
 
 /// A 16x16 scratch canvas with a few drawing helpers.
@@ -408,6 +410,26 @@ pub fn pixels(icon: Icon) -> Vec<u8> {
             c.l(3, 12, 12, 3, W);
             c.f(2, 11, 4, 13, O);
             c.f(11, 2, 13, 4, O);
+        }
+        Icon::Mirror => {
+            // A shape and its reflection either side of a dashed line.
+            c.dash(7, 0, 7, 15, B);
+            c.dash(8, 1, 8, 15, B);
+            for i in 0..5 {
+                c.l(1 + i, 4 + i, 1 + i, 11, W);
+                c.l(14 - i, 4 + i, 14 - i, 11, G);
+            }
+        }
+        Icon::Apply => {
+            // Tick.
+            for i in 0..4 {
+                c.p(3 + i, 8 + i, O);
+                c.p(3 + i, 9 + i, O);
+            }
+            for i in 0..7 {
+                c.p(6 + i, 11 - i, O);
+                c.p(6 + i, 12 - i, O);
+            }
         }
         Icon::Wand => {
             for i in 0..8 {
