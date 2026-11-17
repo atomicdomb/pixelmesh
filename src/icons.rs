@@ -27,9 +27,10 @@ pub enum Icon {
     Wand,
     Mirror,
     Apply,
+    Unwrap,
 }
 
-pub const ALL: [Icon; 47] = [
+pub const ALL: [Icon; 48] = [
     Icon::Object, Icon::Vertex, Icon::Edge, Icon::Face,
     Icon::Click, Icon::BoxSelect, Icon::CircleSelect,
     Icon::Plane, Icon::Cube, Icon::Cylinder, Icon::Cone, Icon::Sphere,
@@ -39,7 +40,7 @@ pub const ALL: [Icon; 47] = [
     Icon::New, Icon::Load, Icon::Save, Icon::Export,
     Icon::EyeOpen, Icon::EyeClosed,
     Icon::Pencil, Icon::Eraser, Icon::Fill, Icon::Picker, Icon::Line, Icon::Rect,
-    Icon::Wand, Icon::Mirror, Icon::Apply,
+    Icon::Wand, Icon::Mirror, Icon::Apply, Icon::Unwrap,
 ];
 
 /// A 16x16 scratch canvas with a few drawing helpers.
@@ -430,6 +431,14 @@ pub fn pixels(icon: Icon) -> Vec<u8> {
                 c.p(6 + i, 11 - i, O);
                 c.p(6 + i, 12 - i, O);
             }
+        }
+        Icon::Unwrap => {
+            // A sheet with islands laid out on it.
+            c.r(1, 1, 14, 14, W);
+            c.f(3, 3, 7, 7, O);
+            c.f(9, 3, 12, 5, G);
+            c.f(9, 7, 12, 12, G);
+            c.f(3, 9, 7, 12, G);
         }
         Icon::Wand => {
             for i in 0..8 {

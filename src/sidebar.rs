@@ -182,6 +182,8 @@ impl App {
             Group(String),
             ToggleGroup(String),
             Eye(Vec<usize>),
+            /// Double-click: select the object and centre the view on it.
+            Frame(usize),
         }
         let mut click = None;
         let row_h = 21.0;
@@ -244,7 +246,9 @@ impl App {
                         // Long names are cut off at the face count instead of pushing the panel wider.
                         painter.with_clip_rect(rect.with_max_x(rect.right() - 58.0)).text(
                             egui::pos2(rect.left() + 24.0 + indent, mid), egui::Align2::LEFT_CENTER, &obj.name, egui::FontId::proportional(13.0), colour);
-                        if resp.clicked() {
+                        if resp.double_clicked() {
+                            click = Some(Click::Frame(*i));
+                        } else if resp.clicked() {
                             click = Some(match x_in {
                                 Some(x) if x < 22.0 + indent => Click::Eye(vec![*i]),
                                 _ => Click::Object(*i),
@@ -264,6 +268,11 @@ impl App {
             Some(Click::Object(i)) => {
                 self.set_mode(SelMode::Object);
                 self.select_object(i, extend);
+            }
+            Some(Click::Frame(i)) => {
+                self.set_mode(SelMode::Object);
+                self.select_object(i, false);
+                self.frame_selected();
             }
             Some(Click::Group(name)) => {
                 let ids: Vec<usize> = self.objects.iter().enumerate().filter(|(_, o)| group_prefix(&o.name) == Some(name.as_str())).map(|(i, _)| i).collect();
@@ -553,20 +562,21 @@ impl App {
     }
 
     fn uv_card(&mut self, ui: &mut egui::Ui) {
-        let w = tile_width(ui, 6);
+        let w = tile_width(ui, 4);
         let tex = self.tex_size();
         #[derive(Clone, Copy)]
-        enum Act { Fit, Box, View, Rotate, FlipU, FlipV }
+        enum Act { Unwrap, Fit, Box, View, Rotate, FlipU, FlipV }
         let mut act = None;
         let items = [
+            (Act::Unwrap, Icon::Unwrap, "Unwrap", "Lay out the UVs automatically: the model is cut into islands along sharp edges, each island is unfolded flat without stretching, and all of them are packed onto the texture on whole pixels.\nWorks on the selected objects, or on the selected faces in an edit mode."),
             (Act::Fit, Icon::UvFit, "Fit", "Stretch every selected face over the whole texture"),
-            (Act::Box, Icon::UvBox, "Box", "Project along the nearest axis at the pixel density below"),
+            (Act::Box, Icon::UvBox, "Box", "Project along the nearest axis at the pixel density below (faces may overlap)"),
             (Act::View, Icon::UvView, "View", "Project the selected faces as seen in the 3D view"),
             (Act::Rotate, Icon::UvRotate, "Rotate", "Rotate the UVs by 90 degrees"),
             (Act::FlipU, Icon::FlipU, "Flip U", "Mirror the UVs left to right"),
             (Act::FlipV, Icon::FlipV, "Flip V", "Mirror the UVs top to bottom"),
         ];
-        for chunk in items.chunks(6) {
+        for chunk in items.chunks(4) {
             row(ui, |ui| {
                 for &(a, icon, label, tip) in chunk {
                     if self.tile(ui, icon, label, false, w).on_hover_text(tip).clicked() {
@@ -576,6 +586,7 @@ impl App {
             });
         }
         match act {
+            Some(Act::Unwrap) => self.unwrap_selection(),
             Some(Act::Fit) => self.uv_op(|m, f| m.uv_fit_each(f)),
             Some(Act::Box) => {
                 let ppu = self.px_per_unit;
@@ -592,7 +603,16 @@ impl App {
         }
         ui.horizontal(|ui| {
             ui.label(RichText::new("Pixels per unit").color(MUTED));
-            ui.add(egui::DragValue::new(&mut self.px_per_unit).speed(0.25).range(1.0..=512.0)).on_hover_text("Texel density used by Box");
+            ui.add(egui::DragValue::new(&mut self.px_per_unit).speed(0.25).range(1.0..=512.0))
+                .on_hover_text("Texel density used by Unwrap and Box: how many texture pixels one unit of the model covers");
+        });
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Seam angle").color(MUTED));
+            ui.add(egui::DragValue::new(&mut self.seam_angle).speed(1.0).range(1.0..=180.0).suffix("°"))
+                .on_hover_text("Unwrap cuts the model along edges sharper than this. Lower: more, flatter islands. Higher: fewer, larger ones.");
+            ui.label(RichText::new("Gap").color(MUTED));
+            ui.add(egui::DragValue::new(&mut self.uv_padding).range(0..=16).suffix(" px"))
+                .on_hover_text("Empty pixels Unwrap leaves between islands");
         });
         ui.checkbox(&mut self.uv.show_all, "Show unselected faces");
     }

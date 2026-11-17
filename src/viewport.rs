@@ -615,6 +615,8 @@ impl App {
             (self.camera.yaw, self.camera.pitch) = (0.0, 1.5707);
         } else if pressed(Key::Num5) {
             self.camera.ortho = !self.camera.ortho;
+        } else if pressed(Key::Period) {
+            self.frame_selected();
         } else if pressed(Key::Home) {
             self.frame_all();
         }

@@ -216,6 +216,10 @@ pub struct App {
     pub show_uv: bool,
     pub show_gizmo: bool,
     pub px_per_unit: f32,
+    /// Unwrap: edges sharper than this many degrees become seams.
+    pub seam_angle: f32,
+    /// Unwrap: empty pixels between islands.
+    pub uv_padding: u32,
     pub segments: u32,
     pub embed_texture: bool,
     project_path: Option<PathBuf>,
@@ -286,6 +290,8 @@ impl App {
             show_uv: true,
             show_gizmo: true,
             px_per_unit: 16.0,
+            seam_angle: 50.0,
+            uv_padding: 1,
             segments: 8,
             embed_texture: false,
             project_path: None,
@@ -1139,6 +1145,9 @@ impl App {
                 ui.separator();
                 ui.checkbox(&mut self.show_uv, "UV / Paint panel   U");
                 ui.checkbox(&mut self.show_gizmo, "Transform handles");
+                if ui.button("Frame selected   .").clicked() {
+                    self.frame_selected();
+                }
                 if ui.button("Frame all   Home").clicked() {
                     self.frame_all();
                 }
@@ -1165,6 +1174,27 @@ impl App {
         if let Some(p) = rfd::FileDialog::new().add_filter("FBX", &["fbx"]).set_file_name(format!("{default}.fbx")).save_file() {
             self.export_fbx(&p);
         }
+    }
+
+    /// Centre the view on the selection: the selected objects, or in an edit mode the
+    /// selected vertices / edges / faces (the whole object if nothing is selected).
+    pub fn frame_selected(&mut self) {
+        let mut pts: Vec<Vec3> = if self.sel_mode == SelMode::Object {
+            self.sel_objects.iter().filter_map(|&i| self.objects.get(i)).flat_map(|o| o.display_mesh().positions.clone()).collect()
+        } else {
+            self.active_verts().iter().map(|&v| self.mesh().positions[v as usize]).collect()
+        };
+        if pts.is_empty() {
+            pts = self.objects.get(self.active).map(|o| o.display_mesh().positions.clone()).unwrap_or_default();
+        }
+        if pts.is_empty() {
+            self.status = "Nothing to centre on.".into();
+            return;
+        }
+        let lo = pts.iter().fold(Vec3::splat(f32::MAX), |a, p| a.min(*p));
+        let hi = pts.iter().fold(Vec3::splat(f32::MIN), |a, p| a.max(*p));
+        self.camera.target = (lo + hi) * 0.5;
+        self.camera.distance = ((hi - lo).length() * 1.6).max(1.5);
     }
 
     pub fn frame_all(&mut self) {
@@ -1331,6 +1361,51 @@ impl App {
         let count = new.len();
         self.select_faces(new);
         self.status = format!("Merged into {count} face(s){}", if skipped > 0 { format!(", {skipped} group(s) skipped") } else { String::new() });
+    }
+
+    /// Lay the UVs out automatically: the selected objects (object mode), or the selected
+    /// faces of the object being edited (all of it if none are selected).
+    pub fn unwrap_selection(&mut self) {
+        let mut jobs: Vec<(usize, BTreeSet<usize>)> = if self.sel_mode == SelMode::Object {
+            let mut ids: Vec<usize> = self.sel_objects.iter().copied().collect();
+            if ids.is_empty() && self.active < self.objects.len() {
+                ids.push(self.active);
+            }
+            ids.into_iter().map(|i| (i, (0..self.objects[i].mesh.faces.len()).collect())).collect()
+        } else {
+            let mut faces = self.active_faces();
+            if faces.is_empty() {
+                faces = (0..self.mesh().faces.len()).collect();
+            }
+            vec![(self.active, faces)]
+        };
+        jobs.retain(|(i, faces)| *i < self.objects.len() && !faces.is_empty());
+        if jobs.is_empty() {
+            self.status = "Nothing to unwrap.".into();
+            return;
+        }
+        self.push_undo();
+        let tex = self.tex_size();
+        let opt = pixelmesh::unwrap::UnwrapOptions {
+            px_per_unit: self.px_per_unit,
+            texture: (tex.x as u32, tex.y as u32),
+            padding: self.uv_padding,
+            seam_angle: self.seam_angle,
+        };
+        let wanted: std::collections::HashMap<usize, BTreeSet<usize>> = jobs.into_iter().collect();
+        let mut meshes: Vec<(&mut Mesh, BTreeSet<usize>)> = self.objects.iter_mut().enumerate()
+            .filter_map(|(i, o)| wanted.get(&i).map(|faces| (&mut o.mesh, faces.clone())))
+            .collect();
+        let r = pixelmesh::unwrap::unwrap(&mut meshes, &opt);
+        self.uv.sel.clear();
+        self.status = if r.px_per_unit == opt.px_per_unit {
+            format!("Unwrapped into {} islands at {} px per unit.", r.islands, r.px_per_unit)
+        } else {
+            format!(
+                "Unwrapped into {} islands at {} px per unit: {} px per unit would need a {}x{} texture, this one is {}x{}.",
+                r.islands, (r.px_per_unit * 100.0).round() / 100.0, opt.px_per_unit, r.needed.0, r.needed.1, opt.texture.0, opt.texture.1
+            )
+        };
     }
 
     /// Right-click menu of the 3D view.

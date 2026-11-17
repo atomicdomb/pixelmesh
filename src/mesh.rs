@@ -1229,7 +1229,7 @@ pub enum UvOp {
 
 /// Tangent / bitangent for projecting a face with the given normal, chosen so
 /// that textures appear upright on walls and unmirrored from outside.
-fn face_basis(n: Vec3) -> (Vec3, Vec3) {
+pub fn face_basis(n: Vec3) -> (Vec3, Vec3) {
     if n.y.abs() > 0.999 {
         // Floor / ceiling: X to the right, "up" on the texture is away from the viewer standing at +Z.
         let t = Vec3::X;

@@ -202,6 +202,7 @@ faces keep their texture exactly in place through all three.
 | X or Delete | Delete (object or faces / vertices) |
 | U | Show / hide the UV editor |
 | 1 / 3 / 7 / 5 / Home | Front / right / top / toggle orthographic / frame all |
+| . (full stop) | Centre the view on the selection. Double-clicking an object in the list does the same |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo |
 
 ## UV editor
@@ -236,7 +237,25 @@ snap to the pixel grid, and S snaps the selection's size to whole pixels.
 The readout at the bottom shows the move or size in pixels. "Snap
 selection now" rounds the selected UVs to the nearest pixel corners.
 
-"Box project" (right panel) unwraps at a fixed texel density ("Pixels per
+**Unwrap** (UV card in the right panel) lays out a whole model for you:
+
+1. The model is cut into islands along every edge sharper than the **Seam
+   angle** (50 degrees by default: a cube becomes six squares, the side of
+   a cylinder stays one strip).
+2. Each island is unfolded flat around its edges like a paper model, so no
+   face is stretched and everything has the same pixel density.
+3. The islands are packed in rows from the top of the texture, on whole
+   pixels, **Gap** pixels apart, at **Pixels per unit**.
+
+In object mode it unwraps all selected objects into one shared layout; in
+an edit mode, the selected faces (or the whole object if none are
+selected). Walls come out upright. If the islands do not fit the texture at
+the chosen density, the highest whole number of pixels per unit that fits
+is used instead and the status bar says what size the original density
+would have needed. Unwrap replaces the UVs of those faces, so run it before
+painting, not after.
+
+"Box" (same card) projects at the same fixed texel density ("Pixels per
 unit"), so a 1-unit face covers exactly e.g. 16x16 pixels. The texture
 reloads automatically when the image changes on disk.
 
@@ -339,6 +358,7 @@ time spent building each frame to the terminal.
 ## Code map
 
 - `src/mesh.rs` - mesh data, primitives, edit and UV operations (unit tested)
+- `src/unwrap.rs` - automatic UV unwrap (unit tested)
 - `src/fbx.rs` - FBX writer
 - `src/fbx_import.rs` - FBX reader (via ufbx)
 - `src/app.rs` - state, menus, files
