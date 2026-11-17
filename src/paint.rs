@@ -70,6 +70,8 @@ struct StrokeState {
     /// Pixels before the stroke: restored each frame for line / rectangle previews, and kept for undo.
     base: Arc<Vec<u8>>,
     size: [u32; 2],
+    /// The stroke's own pixels (pencil, line, rectangle), laid over `base` every frame.
+    layer: Vec<u8>,
     /// Selection tools: how the new region combines, and the selection before the drag.
     op: SelOp,
     base_selection: Option<Vec<bool>>,
@@ -89,6 +91,10 @@ pub struct Paint {
     pub bg: Rgba,
     pub brush: u32,
     pub filled: bool,
+    /// Brush opacity, 0..1: multiplies the colour's own alpha.
+    pub opacity: f32,
+    /// Lay paint over what is there (shading) instead of replacing the pixel outright.
+    pub blend: bool,
     pub show_uv: bool,
     pub show_grid: bool,
     stroke: Option<StrokeState>,
@@ -113,6 +119,8 @@ impl Default for Paint {
             bg: [255, 255, 255, 255],
             brush: 1,
             filled: false,
+            opacity: 1.0,
+            blend: true,
             show_uv: true,
             show_grid: true,
             stroke: None,
@@ -167,6 +175,23 @@ impl App {
             ui.label("Size");
             ui.add(egui::DragValue::new(&mut self.paint.brush).range(1..=32)).on_hover_text("Brush size in pixels  ·  [ and ]");
             ui.checkbox(&mut self.paint.filled, "Filled rect");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Opacity");
+            let mut percent = (self.paint.opacity * 100.0).round();
+            if ui.add(egui::DragValue::new(&mut percent).range(1.0..=100.0).suffix("%"))
+                .on_hover_text("How strongly the brush paints. At 10% each stroke tints what is underneath a little: use black to shade, white to highlight.\nMultiplies the alpha of the chosen colour.")
+                .changed()
+            {
+                self.paint.opacity = percent / 100.0;
+            }
+            for preset in [10.0, 25.0, 50.0, 100.0] {
+                if ui.selectable_label(percent == preset, format!("{preset:.0}")).clicked() {
+                    self.paint.opacity = preset / 100.0;
+                }
+            }
+            ui.checkbox(&mut self.paint.blend, "Blend")
+                .on_hover_text("On: see-through paint is laid over the pixel underneath (each pixel once per stroke).\nOff: the pixel is replaced by the colour and its alpha exactly, for writing real transparency into the image.");
         });
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.paint.show_uv, "UV overlay").on_hover_text("Draw the models' UV outlines over the image");
@@ -419,14 +444,16 @@ impl App {
             if let (Some(mouse), Some(t)) = (mouse, &self.texture) {
                 let secondary = pressed_secondary && !pressed_primary;
                 let tool = if mods.alt { Tool::Picker } else { self.paint.tool };
-                let color = match tool {
+                let mut color = match tool {
                     Tool::Eraser => [0, 0, 0, 0],
                     _ if secondary => self.paint.bg,
                     _ => self.paint.fg,
                 };
+                color[3] = (color[3] as f32 * self.paint.opacity).round() as u8;
                 let op = if mods.command { SelOp::Subtract } else if mods.shift { SelOp::Add } else { SelOp::Replace };
                 self.paint.stroke = Some(StrokeState {
                     tool, color, secondary, start: pixel_at(mouse), last: None, base: t.rgba.clone(), size: t.size,
+                    layer: vec![0; t.rgba.len()],
                     op, base_selection: self.paint.selection.clone(), moved: false,
                 });
             }
@@ -462,26 +489,37 @@ impl App {
                                 new_selection = Some(combine(&stroke.base_selection, region, stroke.op));
                             }
                         }
-                        Tool::Pencil | Tool::Eraser => {
+                        Tool::Eraser => {
                             let data = Arc::make_mut(&mut t.rgba);
-                            pixels::line(data, w, h, stroke.last.unwrap_or(cur), cur, brush, stroke.color);
+                            pixels::line(data, w, h, stroke.last.unwrap_or(cur), cur, brush, [0, 0, 0, 0]);
                             changed = true;
                         }
-                        Tool::Line | Tool::Rect => {
-                            // Redraw the shape from the untouched image every frame.
-                            t.rgba = stroke.base.clone();
-                            let data = Arc::make_mut(&mut t.rgba);
-                            if stroke.tool == Tool::Line {
-                                pixels::line(data, w, h, stroke.start, cur, brush, stroke.color);
-                            } else {
-                                pixels::rect(data, w, h, stroke.start, cur, self.paint.filled, brush, stroke.color);
+                        Tool::Pencil | Tool::Line | Tool::Rect => {
+                            // The stroke is drawn on its own layer and laid over the untouched image, so
+                            // see-through paint tints each pixel once however often the brush crosses it.
+                            match stroke.tool {
+                                Tool::Pencil => pixels::line(&mut stroke.layer, w, h, stroke.last.unwrap_or(cur), cur, brush, stroke.color),
+                                Tool::Line => {
+                                    stroke.layer.fill(0);
+                                    pixels::line(&mut stroke.layer, w, h, stroke.start, cur, brush, stroke.color);
+                                }
+                                _ => {
+                                    stroke.layer.fill(0);
+                                    pixels::rect(&mut stroke.layer, w, h, stroke.start, cur, self.paint.filled, brush, stroke.color);
+                                }
                             }
+                            let data = Arc::make_mut(&mut t.rgba);
+                            pixels::composite(data, &stroke.base, &stroke.layer, self.paint.blend);
                             changed = true;
                         }
                         Tool::Fill => {
                             if stroke.last.is_none() {
+                                let region = pixels::flood_region(&stroke.base, w, h, cur.0, cur.1, mask);
+                                for (k, _) in region.iter().enumerate().filter(|(_, inside)| **inside) {
+                                    stroke.layer[k * 4..k * 4 + 4].copy_from_slice(&stroke.color);
+                                }
                                 let data = Arc::make_mut(&mut t.rgba);
-                                pixels::flood_fill(data, w, h, cur.0, cur.1, stroke.color, mask);
+                                pixels::composite(data, &stroke.base, &stroke.layer, self.paint.blend);
                                 changed = true;
                             }
                         }

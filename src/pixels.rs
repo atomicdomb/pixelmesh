@@ -101,6 +101,35 @@ pub fn flood_fill(data: &mut [u8], w: u32, h: u32, x: i32, y: i32, c: Rgba, allo
     }
 }
 
+/// Lay colour `src` over colour `dst` ("normal" blending, straight alpha).
+pub fn blend_over(dst: Rgba, src: Rgba) -> Rgba {
+    let (sa, da) = (src[3] as f32 / 255.0, dst[3] as f32 / 255.0);
+    let out_a = sa + da * (1.0 - sa);
+    if out_a <= 0.0 {
+        return [0, 0, 0, 0];
+    }
+    let ch = |i: usize| ((src[i] as f32 * sa + dst[i] as f32 * da * (1.0 - sa)) / out_a).round() as u8;
+    [ch(0), ch(1), ch(2), (out_a * 255.0).round() as u8]
+}
+
+/// Combine a stroke with the image it is drawn on. `layer` holds the stroke's own
+/// pixels (alpha 0 = untouched); `base` is the image before the stroke. Each
+/// touched pixel is blended over the base exactly once, however often the brush
+/// passed over it. With `blend` off the stroke's pixels simply replace the base.
+pub fn composite(data: &mut [u8], base: &[u8], layer: &[u8], blend: bool) {
+    for ((out, b), l) in data.chunks_exact_mut(4).zip(base.chunks_exact(4)).zip(layer.chunks_exact(4)) {
+        let under = [b[0], b[1], b[2], b[3]];
+        let px = if l[3] == 0 {
+            under
+        } else if blend {
+            blend_over(under, [l[0], l[1], l[2], l[3]])
+        } else {
+            [l[0], l[1], l[2], l[3]]
+        };
+        out.copy_from_slice(&px);
+    }
+}
+
 /// Put back every pixel outside `mask` from `original` (used to confine a stroke to a selection).
 pub fn restore_outside(data: &mut [u8], original: &[u8], mask: &[bool]) {
     for (k, _) in mask.iter().enumerate().filter(|(_, selected)| !**selected) {
@@ -261,6 +290,35 @@ mod tests {
         assert_eq!(o, vec![[(2, 1), (2, 4)], [(2, 1), (6, 1)], [(2, 4), (6, 4)], [(6, 1), (6, 4)]]);
         // Selecting everything outlines the image border.
         assert_eq!(mask_outline(&vec![true; 64], 8, 8).len(), 4);
+    }
+
+    #[test]
+    fn blending_shades_instead_of_replacing() {
+        // 10% black over mid grey darkens it a little and stays opaque.
+        assert_eq!(blend_over([200, 100, 50, 255], [0, 0, 0, 26]), [180, 90, 45, 255]);
+        // Opaque paint replaces; fully transparent paint does nothing.
+        assert_eq!(blend_over([200, 100, 50, 255], R), R);
+        assert_eq!(blend_over([200, 100, 50, 255], [9, 9, 9, 0]), [200, 100, 50, 255]);
+        // Onto a transparent pixel the colour keeps its own alpha.
+        assert_eq!(blend_over(CLEAR, [10, 20, 30, 128]), [10, 20, 30, 128]);
+        // Half red over half green: both contribute, alpha adds up.
+        let c = blend_over([0, 255, 0, 128], [255, 0, 0, 128]);
+        assert_eq!(c[3], 192);
+        assert!(c[0] > c[1] && c[1] > 60);
+
+        // A stroke that crosses itself still darkens each pixel only once.
+        let base = vec![200u8; 4 * 4 * 4].chunks(4).flat_map(|_| [200, 200, 200, 255]).collect::<Vec<u8>>();
+        let mut layer = vec![0u8; 4 * 4 * 4];
+        let shade = [0, 0, 0, 51];
+        line(&mut layer, 4, 4, (0, 1), (3, 1), 1, shade);
+        line(&mut layer, 4, 4, (3, 1), (0, 1), 1, shade);
+        let mut out = base.clone();
+        composite(&mut out, &base, &layer, true);
+        assert_eq!(get(&out, 4, 4, 2, 1), Some([160, 160, 160, 255]));
+        assert_eq!(get(&out, 4, 4, 2, 2), Some([200, 200, 200, 255]));
+        // With blending off the stroke's colour and alpha are written as they are.
+        composite(&mut out, &base, &layer, false);
+        assert_eq!(get(&out, 4, 4, 2, 1), Some(shade));
     }
 
     #[test]

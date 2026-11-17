@@ -267,6 +267,16 @@ share the same zoom and pan.
 | Select | M | Drag a rectangular selection. Shift adds, Ctrl removes, a single click deselects |
 | Wand | W | Selects the connected area of one colour. Shift adds, Ctrl removes |
 
+**Opacity and blending**: the Opacity value (with 10 / 25 / 50 / 100
+shortcuts) sets how strongly Pencil, Line, Rect and Fill paint; it
+multiplies the alpha of the chosen colour. With **Blend** on (the default)
+see-through paint is laid over the pixel underneath, so black at 10%
+darkens and white at 10% lightens: shading and highlights. Within one
+stroke each pixel is tinted once, however often the brush crosses it; a
+new stroke over the same pixels tints them again. With Blend off, the
+colour and its alpha replace the pixel exactly, which is how to write real
+transparency into the image.
+
 **Selections**: while pixels are selected (dashed outline), every paint
 tool only changes those pixels: strokes are clipped to the selection and
 Fill stops at its edge. The "Selection" row has All (Ctrl+A), None (Ctrl+D
