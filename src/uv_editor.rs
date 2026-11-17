@@ -38,6 +38,8 @@ enum DragKind {
     Handle { anchor: Vec2, handle: Vec2, axes: [bool; 2] },
     /// S key: scale about `pivot`; `half` is half the selection's size.
     Scale { pivot: Vec2, half: Vec2 },
+    /// Dragging a scale arrow: stretch along one axis (0 = U, 1 = V) about the selection's centre.
+    Axis { pivot: Vec2, half: Vec2, axis: usize },
 }
 
 struct Drag {
@@ -313,6 +315,25 @@ impl App {
         }
         let handle_at = |pos: Pos2| handles.iter().find(|h| h.0.distance(pos) <= 8.0).copied();
 
+        // Scale arrows from the middle of the selection: U to the right, V upwards. Each stretches one axis only.
+        const ARROW: f32 = 46.0;
+        let mut arrows: Vec<(usize, Pos2, Pos2)> = Vec::new(); // (axis, centre, tip)
+        if let (Some((lo, hi)), true, true) = (sel_bounds, self.uv.sel.len() > 1, self.uv.drag.is_none()) {
+            let c = to_screen((lo + hi) * 0.5);
+            if hi.x - lo.x > 1e-6 {
+                arrows.push((0, c, c + egui::vec2(ARROW, 0.0)));
+            }
+            if hi.y - lo.y > 1e-6 {
+                arrows.push((1, c, c + egui::vec2(0.0, -ARROW)));
+            }
+        }
+        let arrow_at = |pos: Pos2| {
+            arrows.iter().find(|(_, c, tip)| {
+                // The box at the tip, or the shaft away from the middle.
+                tip.distance(pos) <= 9.0 || (pos.distance(*c) > 10.0 && dist_to_segment(pos, *c, *tip) <= 5.0)
+            }).map(|a| a.0)
+        };
+
         // ---- input
         let keyboard_free = !ui.ctx().egui_wants_keyboard_input();
         let key = |k: Key| keyboard_free && ui.input(|i| i.key_pressed(k) && !i.modifiers.command);
@@ -361,7 +382,10 @@ impl App {
             if let (true, Some(start)) = (resp.drag_started_by(PointerButton::Primary), press) {
                 let element = element_at(start);
                 let selected = element.as_ref().is_some_and(|e| e.is_subset(&self.uv.sel));
-                if let Some((_, at, anchor, axes)) = handle_at(start) {
+                if let (Some(axis), Some((lo, hi))) = (arrow_at(start), sel_bounds) {
+                    let kind = DragKind::Axis { pivot: (lo + hi) * 0.5, half: (hi - lo) * 0.5, axis };
+                    action = Action::StartDrag { select: None, kind, anchor: lo, start: Some(start), modal: false };
+                } else if let Some((_, at, anchor, axes)) = handle_at(start) {
                     action = Action::StartDrag { select: None, kind: DragKind::Handle { anchor, handle: at, axes }, anchor: at, start: Some(start), modal: false };
                 } else if let (Some((lo, _)), true) = (sel_bounds, !selected && op == Op::Replace && frame.is_some_and(|f| f.contains(start))) {
                     // Dragging anywhere inside the selection frame moves the whole group.
@@ -390,7 +414,7 @@ impl App {
                 }
             } else if resp.clicked_by(PointerButton::Primary) {
                 if let Some(pos) = resp.interact_pointer_pos() {
-                    if handle_at(pos).is_none() {
+                    if handle_at(pos).is_none() && arrow_at(pos).is_none() {
                         let hits = if tool == SelectTool::Circle { region_hits(&circle(pos, radius), pos) } else { element_at(pos).unwrap_or_default() };
                         action = Action::Select(match op {
                             Op::Replace => hits,
@@ -504,6 +528,22 @@ impl App {
                         drag.readout = format!("Size {:.1} x {:.1} px", size.x, size.y);
                         (pivot, s, Vec2::ZERO)
                     }
+                    DragKind::Axis { pivot, half, axis } => {
+                        // How far along the arrow the cursor is, relative to where it was grabbed.
+                        let centre = to_screen(pivot);
+                        let along = |p: Pos2| if axis == 0 { p.x - centre.x } else { centre.y - p.y };
+                        let mut f = if along(start).abs() > 1.0 { (along(mouse) / along(start)).max(0.02) } else { 1.0 };
+                        if self.uv.snap && half[axis] > 1e-6 {
+                            // Snap so the selection's edge lands on a pixel boundary.
+                            let edge = ((pivot[axis] + half[axis] * f) * tex[axis]).round() / tex[axis];
+                            f = ((edge - pivot[axis]) / half[axis]).max(0.0);
+                        }
+                        let mut s = Vec2::ONE;
+                        s[axis] = f;
+                        let size = (half * 2.0 * s * tex).abs();
+                        drag.readout = format!("{} size {:.1} px", if axis == 0 { "U" } else { "V" }, size[axis]);
+                        (pivot, s, Vec2::ZERO)
+                    }
                 };
                 let mesh = self.mesh_mut();
                 for &(f, k, orig) in &drag.corners {
@@ -604,6 +644,28 @@ impl App {
                 painter.rect_filled(square, 1.0, if hot { Color32::WHITE } else { bright });
                 painter.rect_stroke(square, 1.0, Stroke::new(1.0, Color32::BLACK), egui::StrokeKind::Middle);
             }
+            // One-axis scale arrows.
+            for &(axis, c, tip) in &arrows {
+                let hot = hover.is_some_and(|h| arrow_at(h) == Some(axis));
+                over_handle |= hot;
+                let colour = if hot {
+                    Color32::from_rgb(255, 235, 120)
+                } else if axis == 0 {
+                    Color32::from_rgb(235, 80, 80)
+                } else {
+                    Color32::from_rgb(110, 205, 70)
+                };
+                painter.line_segment([c, tip], Stroke::new(4.5, Color32::from_black_alpha(150)));
+                painter.line_segment([c, tip], Stroke::new(2.5, colour));
+                let end = Rect::from_center_size(tip, egui::Vec2::splat(11.0));
+                painter.rect_filled(end, 1.0, colour);
+                painter.rect_stroke(end, 1.0, Stroke::new(1.0, Color32::BLACK), egui::StrokeKind::Middle);
+                painter.text(tip + (tip - c).normalized() * 12.0, egui::Align2::CENTER_CENTER, if axis == 0 { "U" } else { "V" }, egui::FontId::proportional(11.0), colour);
+            }
+            if let Some(&(_, c, _)) = arrows.first() {
+                painter.circle_filled(c, 3.0, Color32::WHITE);
+                painter.circle_stroke(c, 3.0, Stroke::new(1.0, Color32::BLACK));
+            }
             // Show what a drag here would do.
             if self.uv.drag.is_some() || over_handle {
                 ui.ctx().set_cursor_icon(if over_handle { egui::CursorIcon::Crosshair } else { egui::CursorIcon::Grabbing });
@@ -637,7 +699,7 @@ impl App {
             None => match resp.hover_pos() {
                 Some(p) => {
                     let uv = to_uv(p);
-                    format!("px {:.0}, {:.0}    drag inside the frame to move · handles or S scale · G move", (uv.x * tex.x).floor(), ((1.0 - uv.y) * tex.y).floor())
+                    format!("px {:.0}, {:.0}    drag in the frame to move · arrows scale one axis · handles or S scale", (uv.x * tex.x).floor(), ((1.0 - uv.y) * tex.y).floor())
                 }
                 None => String::new(),
             },
@@ -647,6 +709,12 @@ impl App {
             painter.text(rect.center_top() + egui::vec2(0.0, 10.0), egui::Align2::CENTER_TOP, "Nothing to show: pick an object, or faces in face mode", font, Color32::from_gray(170));
         }
     }
+}
+
+fn dist_to_segment(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let ab = b - a;
+    let t = ((p - a).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
+    p.distance(a + ab * t)
 }
 
 fn point_in_polygon(p: Vec2, poly: &[Vec2]) -> bool {

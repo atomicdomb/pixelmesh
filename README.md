@@ -12,6 +12,32 @@ Needs a recent stable Rust, a C compiler (for the bundled FBX parser) and
 OpenGL 3.3. On Linux, file dialogs use the
 XDG desktop portal.
 
+## Building a Mac app
+
+`scripts/macos-package.sh` builds `dist/PixelMesh.app` (Apple Silicon and
+Intel in one binary, with the icon from `assets/app-icon.png`) and a zip of
+it. It needs the Xcode command line tools.
+
+**Just for this Mac** (ad-hoc signature):
+
+    scripts/macos-package.sh
+
+**For other Macs** (Developer ID signature, notarized by Apple, so it opens
+with a normal double-click). One-time setup:
+
+1. In Xcode > Settings > Accounts > Manage Certificates, add a
+   "Developer ID Application" certificate. Find its exact name with
+   `security find-identity -v -p codesigning`.
+2. Create an app-specific password at account.apple.com, then store it:
+   `xcrun notarytool store-credentials notary --apple-id YOU@EXAMPLE.COM --team-id TEAMID`
+
+Then each time:
+
+    SIGN_ID="Developer ID Application: Your Name (TEAMID)" NOTARY_PROFILE=notary scripts/macos-package.sh
+
+Send the zip from `dist/`. The bundle identifier defaults to
+`studio.butterflyknights.pixelmesh`; set `BUNDLE_ID` to use another.
+
 ## Layout
 
 | Area   | What it does |
@@ -114,8 +140,15 @@ the same part of the texture.
 
 ## Moving things
 
-- **Arrows**: drag the red / green / blue arrow to move the selection along
-  X / Y / Z. Works for objects, faces and vertices.
+- **Handles**: the Move, Rotate and Scale tiles in the Transform card choose
+  which handles sit on the selection. They work for objects, vertices,
+  edges and faces, and each drag is one undo step.
+  - *Move*: drag the red / green / blue arrow to move along X / Y / Z, or
+    the dot in the middle to move freely.
+  - *Rotate*: drag a ring to turn about that axis. Only the near half of a
+    ring can be grabbed; the far half is drawn faintly.
+  - *Scale*: drag a box to scale along that axis, or the middle box to
+    scale evenly.
 - **Snapping**: tick "Snap every" and set the distance; moves then jump in
   steps of that distance. Holding Ctrl flips the setting while dragging.
   (Rotation snaps to 15 degrees, scale to 0.1.)
@@ -152,7 +185,7 @@ faces keep their texture exactly in place through all three.
 | Input | Action |
 |-------|--------|
 | Click / Shift+click | Select / add to selection |
-| Drag an arrow | Move along that axis |
+| Drag a handle | Move, rotate or scale along / about that axis |
 | Middle- or right-drag (or Alt+left-drag) | Orbit; with Shift: pan |
 | Scroll | Zoom |
 | Tab, O / V / D / F | Toggle object-edit, object / vertex / edge / face mode |
@@ -184,6 +217,7 @@ have a separate UV selection.
 | A / Alt+A | Select all / none |
 | Drag inside the selection frame, or drag any selected vertex / face | Move the whole selection as a group |
 | Drag a handle on the selection frame | Scale; the opposite side stays put. Shift keeps proportions |
+| Drag the U or V arrow in the middle | Scale along that one axis only, about the middle of the selection |
 | G | Move with the mouse; X / Y lock an axis; click confirms, Esc cancels |
 | S | Scale about the centre; X / Y lock an axis |
 | Scroll, right- or middle-drag | Zoom, pan |

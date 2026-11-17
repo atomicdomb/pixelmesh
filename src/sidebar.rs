@@ -408,15 +408,15 @@ impl App {
     fn transform_card(&mut self, ui: &mut egui::Ui) {
         let w = tile_width(ui, 5);
         let object_mode = self.sel_mode == SelMode::Object;
-        let mut start = None;
         row(ui, |ui| {
             for (kind, icon, label, tip) in [
-                (ModalKind::Grab, Icon::Move, "Move", "Move  (G)  ·  or drag an arrow in the view"),
-                (ModalKind::Rotate, Icon::Rotate, "Rotate", "Rotate  (R)  ·  objects turn about their origin"),
-                (ModalKind::Scale, Icon::Scale, "Scale", "Scale  (S)"),
+                (ModalKind::Grab, Icon::Move, "Move", "Show move arrows on the selection: drag one to move along that axis, or the middle to move freely.\nG moves with the mouse."),
+                (ModalKind::Rotate, Icon::Rotate, "Rotate", "Show rotation rings on the selection: drag a ring to turn about that axis.\nR rotates with the mouse."),
+                (ModalKind::Scale, Icon::Scale, "Scale", "Show scale handles on the selection: drag a box to scale along that axis, or the middle box to scale evenly.\nS scales with the mouse."),
             ] {
-                if self.tile(ui, icon, label, false, w).on_hover_text(tip).clicked() {
-                    start = Some(kind);
+                if self.tile(ui, icon, label, self.gizmo_kind == kind, w).on_hover_text(tip).clicked() {
+                    self.gizmo_kind = kind;
+                    self.show_gizmo = true;
                 }
             }
             if self.tile(ui, Icon::Snap, "Snap", self.snap_on, w)
@@ -435,9 +435,6 @@ impl App {
                 }
             });
         });
-        if let Some(kind) = start {
-            self.start_modal(kind, None);
-        }
         ui.horizontal(|ui| {
             ui.label(RichText::new("Snap step").color(MUTED));
             ui.add(egui::DragValue::new(&mut self.grid_snap).speed(0.0125).range(0.001..=10.0).max_decimals(4));

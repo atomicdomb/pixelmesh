@@ -169,9 +169,20 @@ impl Xf {
 
 /// Screen-space layout of the three move arrows.
 struct Gizmo {
+    kind: ModalKind,
     centre: Pos2,
-    /// Arrow tips for X, Y, Z; None when the axis points (almost) straight at the camera.
+    /// Arrow / scale-handle tips for X, Y, Z; None when the axis points (almost) straight at the camera.
     tips: [Option<Pos2>; 3],
+    /// Rotation rings for X, Y, Z as screen polylines; each point says whether it is on the near side.
+    rings: [Vec<(Pos2, bool)>; 3],
+}
+
+/// The part of the gizmo under the cursor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Handle {
+    Axis(usize),
+    /// The middle: free move, or uniform scale.
+    Centre,
 }
 
 const ORANGE: [f32; 4] = [1.0, 0.55, 0.1, 1.0];
@@ -252,10 +263,27 @@ impl App {
         let pivot = self.selection_pivot()?;
         let centre = self.camera.project(rect, pivot)?;
         let len = self.camera.units_per_pixel(rect, pivot) * ARROW_PX;
+        // Origins can only be moved, so "origin only" always shows the arrows.
+        let kind = if self.sel_mode == SelMode::Object && self.origin_only { ModalKind::Grab } else { self.gizmo_kind };
         let tips = AXES.map(|(axis, _, _)| {
             self.camera.project(rect, pivot + axis * len).filter(|tip| tip.distance(centre) > 14.0)
         });
-        Some(Gizmo { centre, tips })
+        let mut rings: [Vec<(Pos2, bool)>; 3] = Default::default();
+        if kind == ModalKind::Rotate {
+            let toward_viewer = (self.camera.eye() - pivot).normalize_or(self.camera.back());
+            for (i, (axis, _, _)) in AXES.iter().enumerate() {
+                let u = axis.any_orthonormal_vector();
+                let v = axis.cross(u);
+                for k in 0..=64 {
+                    let a = k as f32 / 64.0 * std::f32::consts::TAU;
+                    let dir = u * a.cos() + v * a.sin();
+                    if let Some(p) = self.camera.project(rect, pivot + dir * len) {
+                        rings[i].push((p, dir.dot(toward_viewer) >= -0.02));
+                    }
+                }
+            }
+        }
+        Some(Gizmo { kind, centre, tips, rings })
     }
 
     fn update_modal(&mut self, rect: egui::Rect, mouse: Pos2, snap: bool) {
@@ -301,13 +329,29 @@ impl App {
             }),
             ModalKind::Rotate => {
                 let centre = cam.project(rect, m.pivot)?;
-                let angle_of = |p: Pos2| (p.y - centre.y).atan2(p.x - centre.x);
-                // Screen Y points down, so a counter-clockwise turn on screen is a negative atan2 delta.
-                let mut angle = -(angle_of(mouse) - angle_of(start));
                 let axis = m.axis.unwrap_or(toward_viewer);
-                if axis.dot(toward_viewer) < 0.0 {
-                    angle = -angle;
-                }
+                let mut angle = match m.axis {
+                    // About a fixed axis seen reasonably face-on: follow the cursor round that axis
+                    // in the ring's own plane, so the geometry stays under the mouse.
+                    Some(a) if a.dot(toward_viewer).abs() > 0.25 => {
+                        let u = a.any_orthonormal_vector();
+                        let v = a.cross(u);
+                        let angle_of = |p: Pos2| {
+                            let d = plane_hit(m.pivot, a, cam.ray(rect, p)) - m.pivot;
+                            d.dot(v).atan2(d.dot(u))
+                        };
+                        let d = angle_of(mouse) - angle_of(start);
+                        // Shortest way round.
+                        (d + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
+                    }
+                    // Otherwise (free rotation, or a ring seen edge-on): the angle swept on screen.
+                    _ => {
+                        let angle_of = |p: Pos2| (p.y - centre.y).atan2(p.x - centre.x);
+                        // Screen Y points down, so a counter-clockwise turn on screen is a negative atan2 delta.
+                        let screen = -(angle_of(mouse) - angle_of(start));
+                        if axis.dot(toward_viewer) < 0.0 { -screen } else { screen }
+                    }
+                };
                 if snap {
                     let step = 15f32.to_radians();
                     angle = (angle / step).round() * step;
@@ -318,6 +362,13 @@ impl App {
             ModalKind::Scale => {
                 let centre = cam.project(rect, m.pivot)?;
                 let mut s = centre.distance(mouse) / centre.distance(start).max(1.0);
+                if let (true, Some(a)) = (m.drag, m.axis) {
+                    // Pulling a scale handle: how far along the axis the cursor is, relative to where it started.
+                    let (t0, t1) = (line_param(m.pivot, a, cam.ray(rect, start)), line_param(m.pivot, a, cam.ray(rect, mouse)));
+                    if t0.abs() > 1e-4 {
+                        s = (t1 / t0).max(0.01);
+                    }
+                }
                 if snap {
                     s = (s * 10.0).round() / 10.0;
                 }
@@ -981,6 +1032,7 @@ impl App {
         // While the UV editor is running a keyboard move / scale, keys belong to it.
         let keyboard_free = !ui.ctx().egui_wants_keyboard_input() && !self.uv.is_modal();
         let gizmo_before = if self.show_gizmo && !self.busy() { self.gizmo(rect) } else { None };
+        let gizmo_kind = gizmo_before.as_ref().map(|g| g.kind);
         let over_gizmo = |p: Option<Pos2>| gizmo_before.as_ref().zip(p).and_then(|(g, p)| g.hit(p));
 
         if let Some(is_drag) = self.modal.as_ref().map(|m| m.drag) {
@@ -1024,11 +1076,15 @@ impl App {
                     }
                     self.region = Some(Region { start, op, base });
                 }
-                if let Some(axis) = grabbed {
-                    // Pull an arrow: an axis-locked move that follows the drag.
-                    self.start_modal(ModalKind::Grab, Some(AXES[axis].0));
+                if let (Some(handle), Some(kind)) = (grabbed, gizmo_kind) {
+                    // Pull a handle: a move / turn / scale that follows the drag and ends on release.
+                    let axis = match handle {
+                        Handle::Axis(i) => Some(i),
+                        Handle::Centre => None,
+                    };
+                    self.start_modal(kind, axis.map(|i| AXES[i].0));
                     if let Some(m) = &mut self.modal {
-                        m.axis_name = AXES[axis].1;
+                        m.axis_name = axis.map_or("", |i| AXES[i].1);
                         m.start_mouse = press;
                         m.drag = true;
                     }
@@ -1094,28 +1150,68 @@ impl App {
         }
 
         // ---- draw gizmo on top (recomputed so it follows the selection while dragging)
-        let dragging_axis = self.modal.as_ref().filter(|m| m.drag).and_then(|m| AXES.iter().position(|a| Some(a.0) == m.axis));
+        let dragging = self.modal.as_ref().filter(|m| m.drag).map(|m| match AXES.iter().position(|a| Some(a.0) == m.axis) {
+            Some(i) => Handle::Axis(i),
+            None => Handle::Centre,
+        });
         let show = self.show_gizmo && self.modal.as_ref().is_none_or(|m| m.drag) && self.op.is_none() && self.loop_cut.is_none();
-        if let Some(g) = show.then(|| self.gizmo(rect)).flatten() {
-            let hovered = dragging_axis.or_else(|| resp.hover_pos().and_then(|p| g.hit(p)));
-            // Far arrows first so near ones overlap them.
+        if let Some(mut g) = show.then(|| self.gizmo(rect)).flatten() {
+            // While dragging, keep showing the handle type that was grabbed.
+            if let Some(m) = self.modal.as_ref().filter(|m| m.drag) {
+                g.kind = m.kind;
+            }
+            let hovered = dragging.or_else(|| resp.hover_pos().and_then(|p| g.hit(p)));
+            let hot = Color32::from_rgb(255, 235, 120);
+            // Far handles first so near ones overlap them.
             let back = self.camera.back();
             let mut order = [0, 1, 2];
             order.sort_by(|&a, &b| AXES[a].0.dot(back).total_cmp(&AXES[b].0.dot(back)));
             for i in order {
-                let Some(tip) = g.tips[i] else { continue };
-                if dragging_axis.is_some_and(|d| d != i) {
+                if dragging.is_some_and(|d| d != Handle::Axis(i)) {
                     continue;
                 }
-                let color = if hovered == Some(i) { Color32::from_rgb(255, 235, 120) } else { AXES[i].2 };
+                let color = if hovered == Some(Handle::Axis(i)) { hot } else { AXES[i].2 };
+                if g.kind == ModalKind::Rotate {
+                    // Ring: the near half solid, the far half faint.
+                    for pair in g.rings[i].windows(2) {
+                        let (a, b) = (pair[0], pair[1]);
+                        let stroke = if a.1 && b.1 { Stroke::new(2.5, color) } else { Stroke::new(1.0, color.gamma_multiply(0.35)) };
+                        painter.line_segment([a.0, b.0], stroke);
+                    }
+                    continue;
+                }
+                let Some(tip) = g.tips[i] else { continue };
                 let dir = (tip - g.centre).normalized();
                 let side = egui::vec2(-dir.y, dir.x);
-                let neck = tip - dir * 14.0;
-                painter.line_segment([g.centre, neck], Stroke::new(3.0, color));
-                painter.add(egui::Shape::convex_polygon(vec![tip, neck + side * 6.0, neck - side * 6.0], color, Stroke::NONE));
-                painter.text(tip + dir * 10.0, egui::Align2::CENTER_CENTER, AXES[i].1, egui::FontId::proportional(12.0), color);
+                if g.kind == ModalKind::Scale {
+                    // Scale handle: a line ending in a box.
+                    painter.line_segment([g.centre, tip], Stroke::new(3.0, color));
+                    painter.rect_filled(egui::Rect::from_center_size(tip, egui::Vec2::splat(11.0)), 1.0, color);
+                } else {
+                    let neck = tip - dir * 14.0;
+                    painter.line_segment([g.centre, neck], Stroke::new(3.0, color));
+                    painter.add(egui::Shape::convex_polygon(vec![tip, neck + side * 6.0, neck - side * 6.0], color, Stroke::NONE));
+                }
+                painter.text(tip + dir * 12.0, egui::Align2::CENTER_CENTER, AXES[i].1, egui::FontId::proportional(12.0), color);
             }
-            painter.circle_filled(g.centre, 3.5, Color32::WHITE);
+            // Centre: free move (dot) or uniform scale (box). Rotation has no centre handle.
+            if dragging.is_none_or(|d| d == Handle::Centre) {
+                let color = if hovered == Some(Handle::Centre) { hot } else { Color32::WHITE };
+                match g.kind {
+                    ModalKind::Scale => {
+                        let r = egui::Rect::from_center_size(g.centre, egui::Vec2::splat(12.0));
+                        painter.rect_filled(r, 1.0, Color32::from_black_alpha(120));
+                        painter.rect_stroke(r, 1.0, Stroke::new(2.0, color), egui::StrokeKind::Middle);
+                    }
+                    ModalKind::Grab => {
+                        painter.circle_filled(g.centre, 5.0, Color32::from_black_alpha(120));
+                        painter.circle_stroke(g.centre, 5.0, Stroke::new(2.0, color));
+                    }
+                    ModalKind::Rotate => {
+                        painter.circle_filled(g.centre, 2.5, Color32::WHITE);
+                    }
+                }
+            }
         }
 
         // ---- origin markers: selected objects in object mode, the edited object otherwise
@@ -1190,7 +1286,7 @@ impl App {
                 _ if self.select_tool == SelectTool::Box => "Drag a box to select · Shift add · Ctrl remove · Q back to click select",
                 _ if self.select_tool == SelectTool::Circle => "Paint with the circle to select · Shift add · Ctrl remove · [ ] radius · Q back to click select",
                 SelMode::Object if self.origin_only => "Origin mode: drag an arrow or press G to move only the origin (orange ring) · click the Origin tile to leave",
-                SelMode::Object => "Click an object to select · Shift+click add · Drag an arrow to move · G/R/S transform · Tab to edit faces",
+                SelMode::Object => "Click an object to select · Shift+click add · Drag a handle to move, turn or scale · G/R/S · Tab to edit faces",
                 _ => "Click select · Shift adds · Alt/double-click loop · Right-click menu · G/R/S transform · Tab back to objects",
             }.to_string(),
         };
@@ -1219,17 +1315,30 @@ impl App {
 }
 
 impl Gizmo {
-    /// Which arrow (0 = X, 1 = Y, 2 = Z) is under the screen position.
-    fn hit(&self, p: Pos2) -> Option<usize> {
+    /// Which handle is under the screen position.
+    fn hit(&self, p: Pos2) -> Option<Handle> {
+        if self.kind != ModalKind::Rotate && p.distance(self.centre) <= 8.0 {
+            return Some(Handle::Centre);
+        }
         let mut best: Option<(usize, f32)> = None;
-        for (i, tip) in self.tips.iter().enumerate() {
-            let Some(tip) = *tip else { continue };
-            let d = segment_distance(p, self.centre, tip);
-            if d <= 9.0 && best.is_none_or(|(_, bd)| d < bd) {
+        let mut consider = |i: usize, d: f32, reach: f32| {
+            if d <= reach && best.is_none_or(|(_, bd)| d < bd) {
                 best = Some((i, d));
             }
+        };
+        for i in 0..3 {
+            if self.kind == ModalKind::Rotate {
+                // Only the near half of each ring can be grabbed.
+                for pair in self.rings[i].windows(2) {
+                    if pair[0].1 && pair[1].1 {
+                        consider(i, segment_distance(p, pair[0].0, pair[1].0), 7.0);
+                    }
+                }
+            } else if let Some(tip) = self.tips[i] {
+                consider(i, segment_distance(p, self.centre, tip), 9.0);
+            }
         }
-        best.map(|(i, _)| i)
+        best.map(|(i, _)| Handle::Axis(i))
     }
 }
 

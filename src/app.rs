@@ -209,6 +209,8 @@ pub struct App {
 
     /// Object mode: moving affects only the origin, not the geometry.
     pub origin_only: bool,
+    /// Which handles the 3D view shows on the selection: move arrows, rotation rings or scale boxes.
+    pub gizmo_kind: crate::viewport::ModalKind,
     pub snap_on: bool,
     pub grid_snap: f32,
     pub show_uv: bool,
@@ -278,6 +280,7 @@ impl App {
             tex_counter: 0,
             last_mtime_check: 0.0,
             origin_only: false,
+            gizmo_kind: crate::viewport::ModalKind::Grab,
             snap_on: false,
             grid_snap: 0.25,
             show_uv: true,
@@ -1135,7 +1138,7 @@ impl App {
                 ui.checkbox(&mut self.camera.ortho, "Orthographic   5");
                 ui.separator();
                 ui.checkbox(&mut self.show_uv, "UV / Paint panel   U");
-                ui.checkbox(&mut self.show_gizmo, "Move arrows");
+                ui.checkbox(&mut self.show_gizmo, "Transform handles");
                 if ui.button("Frame all   Home").clicked() {
                     self.frame_all();
                 }
