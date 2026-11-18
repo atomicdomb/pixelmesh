@@ -6,7 +6,6 @@ use crate::uv_editor::UvEditor;
 use crate::viewport::Modal;
 use eframe::egui::{self, Key};
 use glam::{Vec2, Vec3};
-use pixelmesh::fbx;
 use pixelmesh::mesh::Mesh;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -59,20 +58,44 @@ pub struct Object {
     /// the object's own X / Y / Z axis. Shown and exported, but not part of `mesh`.
     #[serde(default)]
     pub mirror: [bool; 3],
+    /// Array modifier: repeat the mesh this many times in a row (1 = off)...
+    #[serde(default = "one")]
+    pub array_count: u32,
+    /// ...each copy this far from the last, along the object's own axes.
+    #[serde(default = "unit_x")]
+    pub array_offset: Vec3,
+}
+
+fn one() -> u32 {
+    1
+}
+
+fn unit_x() -> Vec3 {
+    Vec3::X
 }
 
 impl Object {
     pub fn new(name: impl Into<String>, mesh: Mesh) -> Self {
-        Object { name: name.into(), mesh, visible: true, origin: Vec3::ZERO, rotation: Vec3::ZERO, mirror: [false; 3] }
+        Object { name: name.into(), mesh, visible: true, origin: Vec3::ZERO, rotation: Vec3::ZERO, mirror: [false; 3], array_count: 1, array_offset: Vec3::X }
     }
 
     pub fn has_mirror(&self) -> bool {
         self.mirror.iter().any(|m| *m)
     }
 
-    /// The mesh as it is shown and exported: with the mirror modifier applied.
+    pub fn has_array(&self) -> bool {
+        self.array_count > 1
+    }
+
+    /// True when a modifier makes the object look different from its own mesh.
+    pub fn has_modifiers(&self) -> bool {
+        self.has_mirror() || self.has_array()
+    }
+
+    /// The mesh as it is shown and exported: with the mirror and array modifiers applied.
+    /// The object's own faces always come first, in their own order.
     pub fn display_mesh(&self) -> std::borrow::Cow<'_, Mesh> {
-        if !self.has_mirror() {
+        if !self.has_modifiers() {
             return std::borrow::Cow::Borrowed(&self.mesh);
         }
         let q = pixelmesh::xform::euler_quat(self.rotation);
@@ -82,6 +105,12 @@ impl Object {
                 mesh = mesh.mirrored(self.origin, q * axis, 1e-4);
             }
         }
+        if self.has_array() {
+            let unit = mesh.clone();
+            for i in 1..self.array_count.min(512) {
+                mesh.append(&unit.clone().translated(q * self.array_offset * i as f32));
+            }
+        }
         std::borrow::Cow::Owned(mesh)
     }
 
@@ -89,11 +118,11 @@ impl Object {
     pub fn display_key(&self) -> u64 {
         use pixelmesh::mesh::mix;
         let fp = self.mesh.fingerprint();
-        if !self.has_mirror() {
+        if !self.has_modifiers() {
             return fp;
         }
-        let bits = self.mirror.iter().enumerate().fold(0u64, |b, (i, on)| b | (*on as u64) << i);
-        [self.origin, self.rotation].iter().flat_map(|v| v.to_array()).fold(mix(fp, bits + 1), |h, c| mix(h, c.to_bits() as u64))
+        let bits = self.mirror.iter().enumerate().fold(0u64, |b, (i, on)| b | (*on as u64) << i) | (self.array_count as u64) << 8;
+        [self.origin, self.rotation, self.array_offset].iter().flat_map(|v| v.to_array()).fold(mix(fp, bits + 1), |h, c| mix(h, c.to_bits() as u64))
     }
 
     pub fn bounds(&self) -> Option<(Vec3, Vec3)> {
@@ -144,7 +173,7 @@ pub struct Texture {
     pub file_bytes: Vec<u8>,
     pub handle: egui::TextureHandle,
     pub version: u64,
-    mtime: Option<SystemTime>,
+    pub mtime: Option<SystemTime>,
     /// Painted on since it was last loaded or saved.
     pub dirty: bool,
     /// False for a new canvas that has never been saved.
@@ -152,15 +181,22 @@ pub struct Texture {
 }
 
 #[derive(Serialize, Deserialize)]
-struct ProjectFile {
-    version: u32,
+pub struct ProjectFile {
+    pub version: u32,
     #[serde(default)]
-    objects: Vec<Object>,
+    pub objects: Vec<Object>,
     /// Version 1 files stored a single mesh.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    mesh: Option<Mesh>,
-    texture: Option<String>,
-    px_per_unit: f32,
+    pub mesh: Option<Mesh>,
+    pub texture: Option<String>,
+    pub px_per_unit: f32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<crate::scene::RefSave>,
+    /// Only in recovery files: the project file this work belongs to, and where its texture really lives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovered_texture: Option<String>,
 }
 
 pub struct App {
@@ -179,7 +215,7 @@ pub struct App {
     pub op: Option<crate::viewport::OpModal>,
     /// Loop cut being placed.
     pub loop_cut: Option<crate::viewport::LoopCut>,
-    empty: Mesh,
+    pub empty: Mesh,
     pub sel_mode: SelMode,
     last_edit_mode: SelMode,
     pub sel_verts: BTreeSet<u32>,
@@ -187,6 +223,9 @@ pub struct App {
     pub sel_faces: BTreeSet<usize>,
     undo: Vec<UndoStep>,
     redo: Vec<UndoStep>,
+    /// Counts every change to the scene; compared against the counts at the last save / autosave.
+    pub edits: u64,
+    pub saved_edits: u64,
     pub left_tab: LeftTab,
     pub paint: crate::paint::Paint,
     /// Draw data per distinct mesh, and the two cached layers built from it (see `build_frame`).
@@ -209,6 +248,8 @@ pub struct App {
 
     /// Object mode: moving affects only the origin, not the geometry.
     pub origin_only: bool,
+    /// The view was switched to orthographic by a view shortcut; orbiting switches it back.
+    pub auto_ortho: bool,
     /// Which handles the 3D view shows on the selection: move arrows, rotation rings or scale boxes.
     pub gizmo_kind: crate::viewport::ModalKind,
     pub snap_on: bool,
@@ -222,8 +263,28 @@ pub struct App {
     pub uv_padding: u32,
     pub segments: u32,
     pub embed_texture: bool,
-    project_path: Option<PathBuf>,
+    pub project_path: Option<PathBuf>,
     pub status: String,
+
+    /// Handles follow the object's own axes instead of the world's.
+    pub gizmo_local: bool,
+    /// Tint faces in the 3D view by how far their texel density is from "pixels per unit".
+    pub show_density: bool,
+    /// UVs copied from faces (one list of corners per face).
+    pub uv_clipboard: Vec<Vec<Vec2>>,
+    /// Export only the selected objects.
+    pub export_selected: bool,
+    pub settings: crate::scene::Settings,
+    pub autosave: crate::scene::Autosave,
+    /// Reference images for the front, side and top views.
+    pub refs: [Option<crate::scene::RefImage>; 3],
+    pub ref_slot: usize,
+    /// "Quit with unsaved changes?" is showing.
+    pub confirm_quit: bool,
+    /// Segments used by the last bevel; the next one starts with the same.
+    pub bevel_segments: u32,
+    /// Text to put on the system clipboard at the next opportunity (see `copy_uvs`).
+    pub clipboard_marker: Option<&'static str>,
 }
 
 impl App {
@@ -284,6 +345,7 @@ impl App {
             tex_counter: 0,
             last_mtime_check: 0.0,
             origin_only: false,
+            auto_ortho: false,
             gizmo_kind: crate::viewport::ModalKind::Grab,
             snap_on: false,
             grid_snap: 0.25,
@@ -296,8 +358,27 @@ impl App {
             embed_texture: false,
             project_path: None,
             status: "Welcome. Add meshes, drag the arrows to move them, press Tab to edit faces.".into(),
+            edits: 0,
+            saved_edits: 0,
+            gizmo_local: false,
+            show_density: false,
+            uv_clipboard: Vec::new(),
+            export_selected: false,
+            settings: crate::scene::Settings::load(),
+            autosave: crate::scene::Autosave::default(),
+            refs: [None, None, None],
+            ref_slot: 0,
+            confirm_quit: false,
+            bevel_segments: 1,
+            clipboard_marker: None,
         };
-        for a in args {
+        app.load_saved_palette();
+        app.autosave.find_recovery();
+        // `--export file.fbx` / `--export-groups folder`: convert the files given and exit, without opening a window for long.
+        let option = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+        let (export, export_groups) = (option("--export"), option("--export-groups"));
+        let skip: Vec<&String> = [&export, &export_groups].into_iter().flatten().collect();
+        for a in args.iter().filter(|a| !a.starts_with("--") && !skip.contains(a)) {
             let p = Path::new(a);
             match p.extension().and_then(|e| e.to_str()) {
                 Some("png" | "jpg" | "jpeg" | "bmp" | "tga") => app.load_texture(&cc.egui_ctx, p),
@@ -312,6 +393,17 @@ impl App {
                 Some("pmesh") => app.open_project(&cc.egui_ctx, p),
                 _ => {}
             }
+        }
+        if export.is_some() || export_groups.is_some() {
+            if let Some(path) = export {
+                app.export_fbx(Path::new(&path));
+                println!("{}", app.status);
+            }
+            if let Some(dir) = export_groups {
+                app.export_groups(Path::new(&dir));
+                println!("{}", app.status);
+            }
+            std::process::exit(0);
         }
         app
     }
@@ -419,8 +511,8 @@ impl App {
 
     /// Make the active object's mirror permanent: the mirrored half becomes real, editable geometry.
     pub fn apply_mirror(&mut self) {
-        let Some(obj) = self.objects.get(self.active).filter(|o| o.has_mirror()) else {
-            self.status = "This object has no mirror to apply.".into();
+        let Some(obj) = self.objects.get(self.active).filter(|o| o.has_modifiers()) else {
+            self.status = "This object has no mirror or array to apply.".into();
             return;
         };
         let baked = obj.display_mesh().into_owned();
@@ -428,8 +520,9 @@ impl App {
         let obj = &mut self.objects[self.active];
         obj.mesh = baked;
         obj.mirror = [false; 3];
+        obj.array_count = 1;
         self.clear_selection();
-        self.status = "Mirror applied: both halves are now ordinary geometry.".into();
+        self.status = "Applied: the mirrored / repeated copies are now ordinary geometry.".into();
     }
 
     /// Join every selected object into the active one.
@@ -445,6 +538,7 @@ impl App {
         let baked = self.objects[target].display_mesh().into_owned();
         self.objects[target].mesh = baked;
         self.objects[target].mirror = [false; 3];
+        self.objects[target].array_count = 1;
         for &i in &others {
             let mesh = self.objects[i].display_mesh().into_owned();
             self.objects[target].mesh.append(&mesh);
@@ -604,6 +698,7 @@ impl App {
 
     fn push_step(&mut self, step: UndoStep) {
         self.undo.push(step);
+        self.edits += 1;
         // Keep at most 200 steps, and no more than about 256 MB: a snapshot of a big scene is not small.
         let size = |s: &UndoStep| match s {
             UndoStep::Pixels { rgba, .. } => rgba.len(),
@@ -620,6 +715,7 @@ impl App {
 
     /// Apply a step and return the step that reverses it.
     fn swap_step(&mut self, step: UndoStep) -> Option<UndoStep> {
+        self.edits += 1;
         match step {
             UndoStep::Scene(s) => {
                 let inverse = UndoStep::Scene(self.snapshot());
@@ -777,7 +873,7 @@ impl App {
 
     /// Use an image file's bytes as the texture. `path` is where it lives (or would live) on disk.
     /// Returns false when the bytes are not an image this build can decode.
-    fn set_texture(&mut self, ctx: &egui::Context, path: &Path, file_bytes: Vec<u8>) -> bool {
+    pub fn set_texture(&mut self, ctx: &egui::Context, path: &Path, file_bytes: Vec<u8>) -> bool {
         match image::load_from_memory(&file_bytes) {
             Ok(img) => {
                 let img = img.to_rgba8();
@@ -842,7 +938,7 @@ impl App {
         self.status = format!("New {width}x{height} canvas (not saved yet)");
     }
 
-    fn encode_png(t: &Texture) -> Result<Vec<u8>, String> {
+    pub fn encode_png(t: &Texture) -> Result<Vec<u8>, String> {
         let img = image::RgbaImage::from_raw(t.size[0], t.size[1], t.rgba.to_vec()).ok_or("pixel buffer has the wrong size")?;
         let mut out = std::io::Cursor::new(Vec::new());
         img.write_to(&mut out, image::ImageFormat::Png).map_err(|e| e.to_string())?;
@@ -896,7 +992,12 @@ impl App {
                 return;
             }
         };
+        // Importing into an untouched scene is not an unsaved change: the FBX is still there.
+        let clean = self.edits == self.saved_edits;
         self.push_undo();
+        if clean {
+            self.saved_edits = self.edits;
+        }
         let first_new = self.objects.len();
         for obj in imported.objects {
             let name = self.unique_name(&obj.name);
@@ -930,6 +1031,7 @@ impl App {
             notes.push(format!("{} faces had no UVs", imported.faces_without_uvs));
         }
         let notes = if notes.is_empty() { String::new() } else { format!(" ({})", notes.join("; ")) };
+        self.remember(path);
         self.status = format!("Imported {count} object(s) from {}{notes}", path.display());
     }
 
@@ -954,19 +1056,29 @@ impl App {
         }
     }
 
-    fn save_project(&mut self, path: &Path) {
-        let file = ProjectFile {
+    /// The scene as it is written to a project file.
+    pub fn project_file(&self) -> ProjectFile {
+        ProjectFile {
             version: 2,
             objects: self.objects.clone(),
             mesh: None,
             texture: self.texture.as_ref().map(|t| t.path.to_string_lossy().into_owned()),
             px_per_unit: self.px_per_unit,
-        };
+            references: self.refs_to_save(),
+            recovered_project: None,
+            recovered_texture: None,
+        }
+    }
+
+    pub fn save_project(&mut self, path: &Path) {
+        let file = self.project_file();
         let result = serde_json::to_vec(&file).map_err(|e| e.to_string())
             .and_then(|bytes| std::fs::write(path, bytes).map_err(|e| e.to_string()));
         match result {
             Ok(()) => {
                 self.project_path = Some(path.to_path_buf());
+                self.saved_edits = self.edits;
+                self.remember(path);
                 self.status = format!("Saved {}", path.display());
             }
             Err(e) => self.status = format!("Save failed: {e}"),
@@ -991,7 +1103,7 @@ impl App {
                     self.status = format!("{} is not a valid project file", path.display());
                     return;
                 }
-                self.objects = file.objects;
+                self.objects = std::mem::take(&mut file.objects);
                 self.active = 0;
                 self.sel_objects = if self.objects.is_empty() { BTreeSet::new() } else { [0].into() };
                 self.sel_mode = SelMode::Object;
@@ -1001,72 +1113,22 @@ impl App {
                 self.redo.clear();
                 self.texture = None;
                 self.project_path = Some(path.to_path_buf());
+                self.saved_edits = self.edits;
                 self.status = format!("Opened {}", path.display());
-                if let Some(tex) = file.texture {
-                    self.load_texture(ctx, Path::new(&tex));
+                if let Some(tex) = &file.texture {
+                    self.load_texture(ctx, Path::new(tex));
+                }
+                self.refs = [None, None, None];
+                for r in &file.references {
+                    self.load_reference(ctx, r);
+                }
+                if file.recovered_project.is_some() || file.recovered_texture.is_some() || path == self.autosave.project_path().as_deref().unwrap_or(Path::new("")) {
+                    self.finish_recovery(&file);
+                } else {
+                    self.remember(path);
                 }
             }
             Err(e) => self.status = format!("Open failed: {e}"),
-        }
-    }
-
-    fn export_fbx(&mut self, path: &Path) {
-        // Painted but unsaved pixels still have to end up in the exported texture.
-        if let Some(t) = &mut self.texture {
-            if t.dirty || t.file_bytes.is_empty() {
-                match Self::encode_png(t) {
-                    Ok(bytes) => t.file_bytes = bytes,
-                    Err(e) => {
-                        self.status = format!("Export failed: could not encode the texture ({e})");
-                        return;
-                    }
-                }
-            }
-        }
-        let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Mesh").to_string();
-        let tex_name = self.texture.as_ref()
-            .and_then(|t| t.path.file_name().and_then(|n| n.to_str()).map(str::to_string));
-        // Objects without faces would only produce empty nodes.
-        // Mirror modifiers are applied in the exported geometry.
-        let meshes: Vec<std::borrow::Cow<Mesh>> = self.objects.iter().map(|o| o.display_mesh()).collect();
-        let objects: Vec<fbx::FbxObject> = self.objects.iter().zip(&meshes)
-            .filter(|(o, _)| !o.mesh.faces.is_empty())
-            .map(|(o, mesh)| fbx::FbxObject { name: &o.name, mesh, origin: o.origin, rotation: o.rotation })
-            .collect();
-        if objects.is_empty() {
-            self.status = "Nothing to export: the scene has no faces.".into();
-            return;
-        }
-        let count = objects.len();
-        let opt = fbx::FbxOptions {
-            material_name: &name,
-            scale: 1.0,
-            texture: match (&self.texture, &tex_name) {
-                (Some(t), Some(n)) => Some(fbx::FbxTexture {
-                    file_name: n,
-                    embed: self.embed_texture.then_some(t.file_bytes.as_slice()),
-                }),
-                _ => None,
-            },
-        };
-        match fbx::export_file(path, &objects, &opt) {
-            Ok(()) => {
-                let mut msg = format!("Exported {count} object(s) to {}", path.display());
-                // The FBX refers to the texture by file name, so make sure a copy sits next to it.
-                if let (Some(t), Some(n), Some(dir)) = (&self.texture, &tex_name, path.parent()) {
-                    let dest = dir.join(n);
-                    if !self.embed_texture && !dest.exists() {
-                        match std::fs::write(&dest, &t.file_bytes) {
-                            Ok(()) => msg += &format!(" (+ wrote {n})"),
-                            Err(e) => msg += &format!(" (could not write {n}: {e})"),
-                        }
-                    } else if !self.embed_texture && t.dirty {
-                        msg += &format!(" (note: {n} next to it is older than your unsaved paint changes; save the image)");
-                    }
-                }
-                self.status = msg;
-            }
-            Err(e) => self.status = format!("Export failed: {e}"),
         }
     }
 
@@ -1078,6 +1140,7 @@ impl App {
             ui.menu_button("File", |ui| {
                 if ui.button("New").clicked() {
                     self.push_undo();
+                    self.refs = [None, None, None];
                     self.objects.clear();
                     self.sel_objects.clear();
                     self.active = 0;
@@ -1090,6 +1153,7 @@ impl App {
                         self.open_project(&ctx, &p);
                     }
                 }
+                self.recent_menu(ui, &ctx);
                 if ui.button("Save").clicked() {
                     match self.project_path.clone() {
                         Some(p) => self.save_project(&p),
@@ -1120,6 +1184,10 @@ impl App {
                 if ui.button("Export FBX…").clicked() {
                     self.pick_export();
                 }
+                if ui.button("Export FBX per group…").on_hover_text("Write one FBX per name group into a folder: every Doodad_ object into Doodad.fbx, and so on. Objects without a group go into Other.fbx.").clicked() {
+                    self.pick_export_groups();
+                }
+                ui.checkbox(&mut self.export_selected, "Export selected objects only");
                 ui.checkbox(&mut self.embed_texture, "Embed texture in FBX");
                 ui.separator();
                 if ui.button("Quit").clicked() {
@@ -1133,15 +1201,37 @@ impl App {
                 if ui.add_enabled(!self.redo.is_empty(), egui::Button::new("Redo   Ctrl+Shift+Z")).clicked() {
                     self.redo();
                 }
+                ui.separator();
+                if ui.button("Copy UVs   Ctrl+C").on_hover_text("Remember the UVs of the selected faces").clicked() {
+                    self.copy_uvs();
+                }
+                if ui.add_enabled(!self.uv_clipboard.is_empty(), egui::Button::new("Paste UVs   Ctrl+V")).on_hover_text("Give the selected faces the copied UVs").clicked() {
+                    self.paste_uvs();
+                }
             });
             ui.menu_button("View", |ui| {
-                for (label, yaw, pitch) in [("Front   1", 0.0, 0.0), ("Right   3", 1.5708, 0.0), ("Top   7", 0.0, 1.5707)] {
-                    if ui.button(label).clicked() {
-                        self.camera.yaw = yaw;
-                        self.camera.pitch = pitch;
+                for (view, keys) in VIEWS.iter().zip(["1", "Ctrl+1", "3", "Ctrl+3", "7", "Ctrl+7"]) {
+                    if ui.button(format!("{}   {keys}", view.0)).clicked() {
+                        self.set_view(view.1, view.2);
                     }
                 }
-                ui.checkbox(&mut self.camera.ortho, "Orthographic   5");
+                if ui.button("Opposite side   9").clicked() {
+                    self.flip_view();
+                }
+                if ui.checkbox(&mut self.camera.ortho, "Orthographic   5").changed() {
+                    self.auto_ortho = false;
+                }
+                ui.separator();
+                if ui.button("Hide selected   H").clicked() {
+                    self.hide_selected();
+                }
+                if ui.button("Show only selected   Shift+H").clicked() {
+                    self.isolate_selected();
+                }
+                if ui.button("Show everything   Alt+H").clicked() {
+                    self.show_all();
+                }
+                ui.checkbox(&mut self.show_density, "Texel density check").on_hover_text("Tint faces whose pixels per unit differ from the setting in UV Mapping: blue = too few pixels (stretched), red = too many");
                 ui.separator();
                 ui.checkbox(&mut self.show_uv, "UV / Paint panel   U");
                 ui.checkbox(&mut self.show_gizmo, "Transform handles");
@@ -1157,7 +1247,7 @@ impl App {
         });
     }
 
-    fn save_as(&mut self) {
+    pub fn save_as(&mut self) {
         if let Some(p) = rfd::FileDialog::new().add_filter("PixelMesh project", &["pmesh"]).set_file_name("model.pmesh").save_file() {
             self.save_project(&p);
         }
@@ -1169,11 +1259,31 @@ impl App {
         }
     }
 
-    pub fn pick_export(&mut self) {
-        let default = self.project_path.as_ref().and_then(|p| p.file_stem()).and_then(|s| s.to_str()).unwrap_or("model").to_string();
-        if let Some(p) = rfd::FileDialog::new().add_filter("FBX", &["fbx"]).set_file_name(format!("{default}.fbx")).save_file() {
-            self.export_fbx(&p);
-        }
+
+    /// Look straight along an axis. These views are orthographic (no perspective), which is
+    /// what you want for lining things up; orbiting afterwards returns to perspective.
+    pub fn set_view(&mut self, yaw: f32, pitch: f32) {
+        self.auto_ortho |= !self.camera.ortho;
+        self.camera.yaw = yaw;
+        self.camera.pitch = pitch;
+        self.camera.ortho = true;
+    }
+
+    /// Look from the opposite side.
+    pub fn flip_view(&mut self) {
+        self.camera.yaw += std::f32::consts::PI;
+        self.camera.pitch = -self.camera.pitch;
+    }
+
+    /// Name of the axis view the camera is in, if it is in one.
+    pub fn view_name(&self) -> Option<&'static str> {
+        let tau = std::f32::consts::TAU;
+        VIEWS.iter().find(|v| {
+            let dyaw = (self.camera.yaw - v.1).rem_euclid(tau);
+            let same_pitch = (self.camera.pitch - v.2).abs() < 1e-3;
+            // Straight up or down, the heading does not matter.
+            same_pitch && (v.2.abs() > 1.5 || dyaw < 1e-3 || dyaw > tau - 1e-3)
+        }).map(|v| v.0)
     }
 
     /// Centre the view on the selection: the selected objects, or in an edit mode the
@@ -1252,6 +1362,7 @@ impl App {
 
         // Rotation of the active object, about its origin.
         if !(object_mode && self.sel_objects.contains(&self.active) && self.active < self.objects.len()) {
+            self.size_fields(ui);
             return;
         }
         let old = self.objects[self.active].rotation;
@@ -1277,6 +1388,7 @@ impl App {
             }
             obj.rotation = new;
         }
+        self.size_fields(ui);
     }
 
     pub fn extrude(&mut self) {
@@ -1333,7 +1445,9 @@ impl App {
             return;
         }
         self.push_undo();
-        self.op = Some(crate::viewport::OpModal::new(crate::viewport::OpKind::Bevel, self.mesh().clone(), BTreeSet::new(), edges));
+        let mut op = crate::viewport::OpModal::new(crate::viewport::OpKind::Bevel, self.mesh().clone(), BTreeSet::new(), edges);
+        op.segments = self.bevel_segments.max(1);
+        self.op = Some(op);
     }
 
     /// Join the selected faces into single polygons (one per connected group).
@@ -1425,6 +1539,16 @@ impl App {
                 self.merge_selected();
             }
             ui.separator();
+            if ui.add_enabled(n > 0, egui::Button::new("Hide   H")).clicked() {
+                self.hide_selected();
+            }
+            if ui.add_enabled(n > 0, egui::Button::new("Show only this   Shift+H")).clicked() {
+                self.isolate_selected();
+            }
+            if ui.button("Show everything   Alt+H").clicked() {
+                self.show_all();
+            }
+            ui.separator();
             if ui.add_enabled(n > 0, egui::Button::new(if n > 1 { "Delete objects   X" } else { "Delete object   X" })).clicked() {
                 self.delete_selection();
             }
@@ -1442,6 +1566,22 @@ impl App {
         }
         if ui.add_enabled(faces >= 2, egui::Button::new("Merge faces   M")).clicked() {
             self.merge_selected_faces();
+        }
+        if ui.add_enabled(faces > 0, egui::Button::new("Subdivide")).clicked() {
+            self.subdivide_selection();
+        }
+        if ui.add_enabled(any, egui::Button::new("Bridge")).clicked() {
+            self.bridge_selection();
+        }
+        if ui.add_enabled(any, egui::Button::new("Fill hole")).clicked() {
+            self.fill_selection();
+        }
+        ui.separator();
+        if ui.add_enabled(faces > 0, egui::Button::new("Copy UVs   Ctrl+C")).clicked() {
+            self.copy_uvs();
+        }
+        if ui.add_enabled(faces > 0 && !self.uv_clipboard.is_empty(), egui::Button::new("Paste UVs   Ctrl+V")).clicked() {
+            self.paste_uvs();
         }
         ui.separator();
         if ui.add_enabled(faces > 0, egui::Button::new("Extrude   E")).clicked() {
@@ -1491,6 +1631,19 @@ impl App {
                 self.save_project(&p);
             }
         }
+        // Copy / paste act on whichever panel the mouse is over.
+        let (copy, cut, paste) = crate::scene::clipboard_keys(ctx);
+        if copy || cut || paste {
+            let over_view = ctx.pointer_latest_pos().is_some_and(|p| self.viewport_rect.contains(p));
+            let painting = self.show_uv && self.left_tab == LeftTab::Paint && !over_view;
+            if painting {
+                self.paint_clipboard(ctx, copy, cut, paste);
+            } else if copy {
+                self.copy_uvs();
+            } else if paste {
+                self.paste_uvs();
+            }
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, Key::J)) {
             self.merge_selected();
         }
@@ -1531,6 +1684,11 @@ impl eframe::App for App {
         }));
         self.poll_texture(&ctx);
         self.shortcuts(&ctx);
+        if let Some(text) = self.clipboard_marker.take() {
+            ctx.copy_text(text.into());
+        }
+        self.autosave_tick(&ctx);
+        self.scene_dialogs(&ctx);
 
         // Menus and tools are locked while a move / rotate / scale is in progress.
         let idle = !self.busy();
@@ -1578,8 +1736,20 @@ impl eframe::App for App {
         if let (Some(gl), Some(r)) = (gl, &self.renderer) {
             r.lock().unwrap().destroy(gl);
         }
+        // A clean exit leaves nothing to recover.
+        self.autosave.clear();
     }
 }
+
+/// The six axis views: name, yaw, pitch. "Front" looks at the side of the model facing +Z.
+pub const VIEWS: [(&str, f32, f32); 6] = [
+    ("Front", 0.0, 0.0),
+    ("Back", std::f32::consts::PI, 0.0),
+    ("Right", std::f32::consts::FRAC_PI_2, 0.0),
+    ("Left", -std::f32::consts::FRAC_PI_2, 0.0),
+    ("Top", 0.0, 1.5707),
+    ("Bottom", 0.0, -1.5707),
+];
 
 /// Runs a closure when dropped (end of scope).
 struct Defer<F: FnOnce()>(Option<F>);

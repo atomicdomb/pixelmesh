@@ -44,7 +44,7 @@ Send the zip from `dist/`. The bundle identifier defaults to
 |--------|--------------|
 | Left   | UV editor and Paint tabs (hide with the "UV / Paint panel" button in the menu bar, or U) |
 | Centre | 3D viewport |
-| Right  | Object list, modes, add meshes, transform, mesh ops, UV mapping, texture, export |
+| Right  | Object list, modes, add meshes, transform, modifiers, mesh ops, UV mapping, texture, reference image, export |
 
 ## Objects and modes
 
@@ -120,7 +120,7 @@ rotation, and read back on import.
 
 ## Mirror
 
-The Mirror card adds a live mirror to the active object: turn on X, Y or Z
+The Modifiers card adds a live mirror to the active object: turn on X, Y or Z
 (or several) and a reflected copy appears on the other side of the
 object's **origin**, along that axis of the object.
 
@@ -137,6 +137,37 @@ object's **origin**, along that axis of the object.
 
 The mirrored half uses the same UVs as the original, so both sides show
 the same part of the texture.
+
+## Array
+
+The Modifiers card also has **Array**: set the count above 1 and the active
+object is repeated in a row, each copy one **Step** further along the
+object's own axes. Fences, stairs and runs of tiles are one object plus a
+count. Like the mirror, the copies follow every edit, are tinted while you
+edit, are written into exported FBX files, and become ordinary geometry
+with **Apply**. Mirror and array can be combined (the mirror comes first).
+
+## Hiding objects
+
+- **H** hides the selected objects, **Shift+H** shows only them (in an edit
+  mode: only the object being edited), **Alt+H** shows everything again.
+- The same three are the Hide / Solo / Show all buttons under the object
+  list, in the View menu and in the right-click menu. The eye in the object
+  list toggles one object or one group.
+- Hidden objects cannot be picked or moved, and the top-left of the 3D view
+  says how many are hidden. They are still exported.
+
+## Reference images
+
+The Reference image card loads a picture to model against, one each for the
+**Front**, **Side** and **Top** views. A picture appears only when you look
+straight along its axis in orthographic view (1, 3, 7 and their Ctrl
+opposites), so it never gets in the way while orbiting.
+
+Height sets its size in scene units (front and side pictures stand on the
+ground), Offset slides it, Opacity fades it, and **In front** draws it over
+the model instead of behind it. Reference images are saved in the project
+file by path.
 
 ## Moving things
 
@@ -162,14 +193,29 @@ becomes one polygon and keeps its texture mapping. Vertices on the outline
 stay if a neighbouring face still uses them. A group is skipped when its
 outline is not a single loop (for example a ring of faces round a hole).
 
+## Views
+
+The buttons at the top right of the 3D view (and the View menu, and the
+keys below) look straight at the model from the front, back, right, left,
+top or bottom. These views are orthographic, so parallel edges stay
+parallel and things line up; the current one is named at the top left.
+Orbiting away returns to perspective. "Ortho" (or 5) switches between the
+two by hand, and then it stays as you set it.
+
+"Front" shows the side of the model that faces +Z, the blue axis.
+
 ## Inset, bevel, loop cut
 
 All three work on the object being edited (Tab into vertex / face mode first).
 
 - **Inset (I)**: shrinks the selected faces inwards and leaves a rim of
   new faces. Several selected faces inset together as one region.
-- **Bevel (Ctrl+B)**: chamfers edges. In face mode it takes every edge of
-  the selected faces; in vertex mode every edge whose two ends are selected.
+- **Bevel (Ctrl+B)**: chamfers or rounds edges. In face mode it takes every
+  edge of the selected faces; in vertex mode every edge whose two ends are
+  selected. While sizing it, press **1-9** for the number of segments: 1 is
+  a flat chamfer, more follow a quarter circle. The number is remembered
+  for the next bevel. Corners where three or more rounded edges meet are
+  closed with a fan of triangles.
 - **Loop cut (Ctrl+R)**: hover an edge and a yellow preview shows the cut
   running round the ring of quads. Press 1-9 for the number of cuts, click
   to place. A single cut can then be slid along the edge; click again to
@@ -179,6 +225,32 @@ Inset and bevel are sized by moving the mouse to the right; click or Enter
 confirms, Esc or right-click cancels. Snapping ("Snap every" / Ctrl) applies
 to the inset and bevel width and to the loop-cut slide distance. Existing
 faces keep their texture exactly in place through all three.
+
+## Subdivide, bridge, fill
+
+- **Subdivide**: splits the selected faces evenly. A quad becomes four
+  quads, a triangle four triangles. Neighbouring faces receive the new
+  midpoints so the mesh stays closed, and UVs are interpolated.
+- **Bridge**: joins two edge loops with a band of quads. Select the two
+  loops in edge mode (Alt+click each, Shift to add the second). In face
+  mode, select two faces with the same number of corners: both are removed
+  and their outlines joined, which makes a tunnel or a connecting piece.
+- **Fill**: closes a hole. Select the edges (or vertices) around it and a
+  face is made, facing the same way as its neighbours.
+
+All three are tiles in the Mesh card and entries in the right-click menu.
+
+## Size, and local axes
+
+Under Pos and Rot the Transform card shows **Size**: the active object's
+extent along its own X, Y and Z. Typing a number scales the object about
+its origin to exactly that size. In an edit mode it shows the size of the
+selection and scales it about its middle.
+
+**Local axes** (next to Snap step) points the move arrows, rotation rings
+and scale handles along the active object's own axes instead of the
+world's, and makes X / Y / Z during G, R, S lock to those axes. It matters
+once an object has been rotated.
 
 ## 3D viewport
 
@@ -200,8 +272,13 @@ faces keep their texture exactly in place through all three.
 | I / Ctrl+B / Ctrl+R | Inset / bevel / loop cut |
 | Shift+D | Duplicate (object or faces) |
 | X or Delete | Delete (object or faces / vertices) |
+| H / Shift+H / Alt+H | Hide selected / show only selected / show everything |
+| Ctrl+C / Ctrl+V | Copy / paste the UVs of the selected faces |
 | U | Show / hide the UV editor |
-| 1 / 3 / 7 / 5 / Home | Front / right / top / toggle orthographic / frame all |
+| 1 / 3 / 7 | Front / right / top view |
+| Ctrl+1 / Ctrl+3 / Ctrl+7 (or Cmd) | Back / left / bottom view |
+| 9 | The opposite side of the current view |
+| 5 / Home | Toggle orthographic / frame all |
 | . (full stop) | Centre the view on the selection. Double-clicking an object in the list does the same |
 | Ctrl+Z / Ctrl+Shift+Z | Undo / redo |
 
@@ -221,6 +298,7 @@ have a separate UV selection.
 | Drag the U or V arrow in the middle | Scale along that one axis only, about the middle of the selection |
 | G | Move with the mouse; X / Y lock an axis; click confirms, Esc cancels |
 | S | Scale about the centre; X / Y lock an axis |
+| L / Shift+L | Select the whole island under the mouse / add it. The Linked button grows the selection to whole islands |
 | Scroll, right- or middle-drag | Zoom, pan |
 
 With two or more vertices selected a frame is drawn around them, slightly
@@ -285,6 +363,32 @@ share the same zoom and pan.
 | Rect | U | Drag for a rectangle; "Filled rect" fills it |
 | Select | M | Drag a rectangular selection. Shift adds, Ctrl removes, a single click deselects |
 | Wand | W | Selects the connected area of one colour. Shift adds, Ctrl removes |
+| Move | V | Drag the selected pixels somewhere else (the whole image if nothing is selected). Ctrl at the start of the drag leaves a copy behind. Arrow keys nudge by one pixel |
+
+**Paint on model**: tick it and, while the Paint tab is open, the left
+button paints straight onto the model in the 3D view with the pencil,
+eraser, fill or picker. The stroke lands on whatever texture pixel is under
+the cursor, so faces that share pixels are painted together. Orbit with the
+right or middle button; the top-left of the view shows the pixel under the
+cursor. Selections still confine the paint. Untick it to select and move
+things in the 3D view again.
+
+**Mirror**: X mirrors every stroke left to right, Y top to bottom, both
+give four-way symmetry. The number beside each is where the mirror line
+sits (drawn as a dashed line); right-click the number to put it back in the
+middle. Applies to Pencil, Eraser, Line and Rect.
+
+**Moving, copying and pasting pixels**: Ctrl+C copies the selected pixels
+(the whole image without a selection), Ctrl+X cuts them, Ctrl+V pastes
+under the mouse and switches to the Move tool. Pixels that were just moved
+or pasted keep "floating": you can move or nudge them again without
+disturbing what is underneath, until you paint or select something else.
+Transparent pixels in the moved piece leave the image under them alone.
+
+**Palettes**: "Palette…" replaces the starter swatches with a palette file:
+GIMP `.gpl`, JASC `.pal`, `.hex`, paint.net `.txt`, or any image (its
+colours are used, up to 256). Aseprite exports all of these. The choice is
+remembered between sessions; "Default" goes back to the built-in 16.
 
 **Opacity and blending**: the Opacity value (with 10 / 25 / 50 / 100
 shortcuts) sets how strongly Pencil, Line, Rect and Fill paint; it
@@ -340,8 +444,46 @@ pivot and rotation are the object's origin and rotation. The
 texture is referenced by file name (a copy is placed next to the .fbx if
 missing) or embedded if "Embed texture in FBX" is ticked.
 
+Export variants, in the File menu:
+
+- **Export selected objects only**: the Export button writes just the
+  selection (in an edit mode, the object being edited).
+- **Export FBX per group…**: choose a folder and every name group gets its
+  own file: all `Doodad_` objects in `Doodad.fbx`, all `Wall_` objects in
+  `Wall.fbx`, and objects without a group in `Other.fbx`.
+- From the command line, without using the window:
+  `pixelmesh scene.pmesh --export out.fbx` or
+  `pixelmesh tiles.fbx --export-groups folder`.
+
 `cargo test` round-trips exports through the ufbx parser in strict mode and
 imports FBX files written by Blender (`tests/fixtures`).
+
+## UV extras
+
+- **Copy UVs / Paste UVs** (UV Mapping card, right-click menu, Ctrl+C /
+  Ctrl+V over the 3D view): copy the UVs of the selected faces and paste
+  them onto other faces, so identical faces share the same pixels. A face
+  takes its UVs from a copied face with the same number of corners; several
+  copied faces are handed out in order. If a pasted face comes out turned,
+  use Rotate.
+- **Texel density check** (UV Mapping card or View menu): tints faces in
+  the 3D view whose pixels per unit differ from the "Pixels per unit"
+  setting. Blue has too few pixels (the texture looks stretched), red has
+  too many, untinted faces match within about 5%.
+
+## Autosave, recovery and recent files
+
+- Once a minute, unsaved work (the scene and any unsaved paint) is copied
+  to a recovery file in the background. If PixelMesh does not close
+  properly, the next launch offers to **Recover** it. A normal exit, or
+  saving everything, removes the copy.
+- Closing the window with unsaved changes asks first: Save and quit, Quit
+  without saving, or Cancel. A full FBX export counts as saving the scene.
+- **File > Open recent** lists the last ten projects and imported FBX
+  files.
+- Settings and the recovery file live in
+  `~/Library/Application Support/PixelMesh` on macOS (`~/.config/pixelmesh`
+  on Linux, `%APPDATA%\PixelMesh` on Windows).
 
 ## Large scenes
 
@@ -358,6 +500,8 @@ time spent building each frame to the terminal.
 ## Code map
 
 - `src/mesh.rs` - mesh data, primitives, edit and UV operations (unit tested)
+- `src/mesh_ops.rs` - subdivide, bridge, fill, ray-to-UV and density look-ups (unit tested)
+- `src/scene.rs` - settings, autosave, recent files, hiding, export variants, reference images
 - `src/unwrap.rs` - automatic UV unwrap (unit tested)
 - `src/fbx.rs` - FBX writer
 - `src/fbx_import.rs` - FBX reader (via ufbx)

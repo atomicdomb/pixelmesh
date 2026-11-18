@@ -188,6 +188,133 @@ pub fn used_colors(data: &[u8], max: usize) -> Vec<Rgba> {
     list.into_iter().take(max).map(|(c, _)| c).collect()
 }
 
+/// Read the colours out of a palette file's text. Understands GIMP `.gpl`, JASC `.pal`,
+/// `.hex` (one RRGGBB per line) and paint.net `.txt` (AARRGGBB). Duplicates are dropped
+/// and at most 256 colours are returned.
+pub fn parse_palette(text: &str) -> Vec<Rgba> {
+    let mut out: Vec<Rgba> = Vec::new();
+    // A JASC file starts with three header lines: the name, a version and the colour count.
+    let mut skip = 0;
+    for line in text.lines() {
+        let line = line.trim().trim_start_matches('\u{feff}');
+        if skip > 0 {
+            skip -= 1;
+            continue;
+        }
+        if line.eq_ignore_ascii_case("JASC-PAL") {
+            skip = 2;
+            continue;
+        }
+        let hex = line.strip_prefix('#').unwrap_or(line);
+        let is_hex = (hex.len() == 6 || hex.len() == 8) && hex.chars().all(|c| c.is_ascii_hexdigit()) && !hex.contains(' ');
+        let color = if is_hex {
+            let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).unwrap_or(0);
+            // Eight digits: paint.net's AARRGGBB.
+            Some(if hex.len() == 8 { [byte(2), byte(4), byte(6), byte(0)] } else { [byte(0), byte(2), byte(4), 255] })
+        } else if line.starts_with('#') || line.starts_with(';') {
+            None
+        } else {
+            // "R G B" (optionally followed by a name).
+            let nums: Vec<u8> = line.split_whitespace().take(3).map_while(|t| t.parse::<u8>().ok()).collect();
+            (nums.len() == 3).then(|| [nums[0], nums[1], nums[2], 255])
+        };
+        if let Some(c) = color {
+            if !out.contains(&c) && out.len() < 256 {
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// The distinct colours of an image in the order they first appear (row by row), at most `max`.
+pub fn image_palette(data: &[u8], max: usize) -> Vec<Rgba> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for px in data.chunks_exact(4) {
+        let c = [px[0], px[1], px[2], px[3]];
+        if c[3] != 0 && seen.insert(c) {
+            out.push(c);
+            if out.len() >= max {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// A piece of an image that was cut or copied: a rectangle of pixels with a mask saying which of them count.
+#[derive(Clone)]
+pub struct Clip {
+    pub w: u32,
+    pub h: u32,
+    pub rgba: Vec<u8>,
+    pub mask: Vec<bool>,
+    /// Where its top-left corner was in the image it came from.
+    pub origin: (i32, i32),
+}
+
+/// Copy the masked pixels (all of them without a mask) into a clip cropped to their bounding box.
+pub fn lift(data: &[u8], w: u32, h: u32, mask: Option<&[bool]>) -> Option<Clip> {
+    let selected = |x: u32, y: u32| mask.is_none_or(|m| m[(y * w + x) as usize]);
+    let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
+    for y in 0..h {
+        for x in 0..w {
+            if selected(x, y) {
+                (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+            }
+        }
+    }
+    if x0 == u32::MAX {
+        return None;
+    }
+    let (cw, ch) = (x1 - x0 + 1, y1 - y0 + 1);
+    let mut clip = Clip { w: cw, h: ch, rgba: vec![0; (cw * ch * 4) as usize], mask: vec![false; (cw * ch) as usize], origin: (x0 as i32, y0 as i32) };
+    for y in 0..ch {
+        for x in 0..cw {
+            if selected(x0 + x, y0 + y) {
+                let (src, dst) = ((((y0 + y) * w + x0 + x) * 4) as usize, ((y * cw + x) * 4) as usize);
+                clip.rgba[dst..dst + 4].copy_from_slice(&data[src..src + 4]);
+                clip.mask[(y * cw + x) as usize] = true;
+            }
+        }
+    }
+    Some(clip)
+}
+
+/// Put a clip into an image with its top-left corner at `at`. Transparent pixels of the clip
+/// leave the image alone. Returns the mask of the image pixels the clip covers.
+pub fn drop_clip(data: &mut [u8], w: u32, h: u32, clip: &Clip, at: (i32, i32)) -> Vec<bool> {
+    let mut covered = vec![false; (w * h) as usize];
+    for y in 0..clip.h as i32 {
+        for x in 0..clip.w as i32 {
+            let k = (y as u32 * clip.w + x as u32) as usize;
+            if !clip.mask[k] {
+                continue;
+            }
+            let Some(i) = index(w, h, at.0 + x, at.1 + y) else { continue };
+            covered[i / 4] = true;
+            if clip.rgba[k * 4 + 3] != 0 {
+                data[i..i + 4].copy_from_slice(&clip.rgba[k * 4..k * 4 + 4]);
+            }
+        }
+    }
+    covered
+}
+
+/// Make the masked pixels transparent.
+pub fn clear_masked(data: &mut [u8], mask: &[bool]) {
+    for (k, _) in mask.iter().enumerate().filter(|(_, m)| **m) {
+        data[k * 4..k * 4 + 4].copy_from_slice(&[0, 0, 0, 0]);
+    }
+}
+
+/// Mirror image of a brush position across the line `axis` (a pixel boundary), for a brush `size` pixels wide.
+pub fn mirror_coord(x: i32, axis: i32, size: u32) -> i32 {
+    let (n, off) = (size as i32, (size as i32 - 1) / 2);
+    2 * axis - x + 2 * off - n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,5 +455,48 @@ mod tests {
         set(&mut d, 4, 4, 0, 3, G);
         assert_eq!(used_colors(&d, 8), vec![R, G]);
         assert_eq!(used_colors(&d, 1), vec![R]);
+    }
+
+    #[test]
+    fn palettes() {
+        let gpl = "GIMP Palette\nName: Test\nColumns: 4\n#\n255   0   0\tRed\n  0 255   0 Green\n255 0 0 again\n";
+        assert_eq!(parse_palette(gpl), vec![R, G]);
+        let jasc = "JASC-PAL\n0100\n2\n255 0 0\n0 255 0\n";
+        assert_eq!(parse_palette(jasc), vec![R, G]);
+        assert_eq!(parse_palette("ff0000\n#00FF00\n"), vec![R, G]);
+        assert_eq!(parse_palette("; paint.net\n80FF0000\n"), vec![[255, 0, 0, 128]]);
+        assert_eq!(image_palette(&[255, 0, 0, 255, 0, 0, 0, 0, 0, 255, 0, 255, 255, 0, 0, 255], 8), vec![R, G]);
+    }
+
+    #[test]
+    fn lift_and_drop_move_pixels() {
+        // 4x2 image, red at (1,0) and green at (2,0).
+        let mut data = vec![0u8; 4 * 2 * 4];
+        set(&mut data, 4, 2, 1, 0, R);
+        set(&mut data, 4, 2, 2, 0, G);
+        let mask = [false, true, true, false, false, false, false, false];
+        let clip = lift(&data, 4, 2, Some(&mask)).unwrap();
+        assert_eq!((clip.w, clip.h, clip.origin), (2, 1, (1, 0)));
+        clear_masked(&mut data, &mask);
+        assert_eq!(count(&data, CLEAR), 8);
+        // Dropped one row down and one to the right; the part hanging over the edge is cut off.
+        let covered = drop_clip(&mut data, 4, 2, &clip, (3, 1));
+        assert_eq!(get(&data, 4, 2, 3, 1), Some(R));
+        assert_eq!(covered.iter().filter(|c| **c).count(), 1);
+        assert!(lift(&data, 4, 2, Some(&[false; 8])).is_none());
+    }
+
+    #[test]
+    fn mirrored_brush_covers_the_mirrored_pixels() {
+        for size in 1..=4u32 {
+            for x in 0..8 {
+                let mut a = vec![0u8; 8 * 4];
+                let mut b = vec![0u8; 8 * 4];
+                stamp(&mut a, 8, 1, x, 0, size, R);
+                stamp(&mut b, 8, 1, mirror_coord(x, 4, size), 0, size, R);
+                let flipped: Vec<u8> = a.chunks_exact(4).rev().flatten().copied().collect();
+                assert_eq!(flipped, b, "size {size} at {x}");
+            }
+        }
     }
 }

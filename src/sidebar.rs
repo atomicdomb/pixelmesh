@@ -138,10 +138,11 @@ impl App {
             card(ui, "SELECT", |ui| self.select_card(ui));
             card(ui, "ADD MESH", |ui| self.add_card(ui));
             card(ui, "TRANSFORM", |ui| self.transform_card(ui));
-            card(ui, "MIRROR", |ui| self.mirror_card(ui));
+            card(ui, "MODIFIERS", |ui| self.mirror_card(ui));
             card(ui, "MESH", |ui| self.mesh_card(ui));
             card(ui, "UV MAPPING", |ui| self.uv_card(ui));
             card(ui, "TEXTURE", |ui| self.texture_card(ui, &ctx));
+            card(ui, "REFERENCE IMAGE", |ui| self.reference_card(ui));
         });
     }
 
@@ -328,6 +329,17 @@ impl App {
                 self.merge_selected();
             }
         });
+        ui.horizontal(|ui| {
+            if ui.add_enabled(object_mode && !self.sel_objects.is_empty(), egui::Button::new("Hide").small()).on_hover_text("Hide the selected objects  ·  H").clicked() {
+                self.hide_selected();
+            }
+            if ui.small_button("Solo").on_hover_text("Show only the selected objects (in an edit mode: only the one being edited)  ·  Shift+H").clicked() {
+                self.isolate_selected();
+            }
+            if ui.add_enabled(self.objects.iter().any(|o| !o.visible), egui::Button::new("Show all").small()).on_hover_text("Make every object visible again  ·  Alt+H").clicked() {
+                self.show_all();
+            }
+        });
     }
 
     fn select_card(&mut self, ui: &mut egui::Ui) {
@@ -447,6 +459,8 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Snap step").color(MUTED));
             ui.add(egui::DragValue::new(&mut self.grid_snap).speed(0.0125).range(0.001..=10.0).max_decimals(4));
+            ui.checkbox(&mut self.gizmo_local, "Local axes")
+                .on_hover_text("Point the handles (and the X / Y / Z keys while moving) along the object's own axes instead of the world's. Makes a difference once an object has been rotated.");
         });
         self.position_fields(ui);
         if !self.objects.is_empty() {
@@ -488,10 +502,10 @@ impl App {
                     toggle = Some(axis);
                 }
             }
-            ui.add_enabled_ui(mirror.iter().any(|m| *m), |ui| {
+            ui.add_enabled_ui(self.objects[active].has_modifiers(), |ui| {
                 apply = self.tile(ui, Icon::Apply, "Apply", false, w)
-                    .on_hover_text("Make the mirror permanent: the mirrored half becomes ordinary geometry you can edit")
-                    .on_disabled_hover_text("Turn on a mirror axis first")
+                    .on_hover_text("Make the mirror and array permanent: the copies become ordinary geometry you can edit")
+                    .on_disabled_hover_text("Turn on a mirror axis or an array first")
                     .clicked();
             });
         });
@@ -505,23 +519,52 @@ impl App {
         if mirror.iter().any(|m| *m) {
             ui.label(RichText::new("Mirrors across the origin (orange ring).").size(10.5).color(MUTED));
         }
+
+        // Array: the object repeated in a row.
+        let (old_count, old_offset) = (self.objects[active].array_count, self.objects[active].array_offset);
+        let (mut count, mut offset) = (old_count, old_offset);
+        let mut started = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Array").color(MUTED)).on_hover_text("Repeat the active object in a row: fences, steps, runs of tiles. The copies update as you edit and are included when exporting. Apply turns them into ordinary geometry.");
+            let r = ui.add(egui::DragValue::new(&mut count).range(1..=512).suffix("×")).on_hover_text("How many in total (1 = off)");
+            started |= r.drag_started() || r.gained_focus();
+        });
+        if count > 1 {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Step").color(MUTED)).on_hover_text("Distance from one copy to the next, along the object's own axes");
+                for (axis, label) in ["X ", "Y ", "Z "].into_iter().enumerate() {
+                    let r = ui.add(egui::DragValue::new(&mut offset[axis]).speed(0.01).prefix(label).max_decimals(3));
+                    started |= r.drag_started() || r.gained_focus();
+                }
+            });
+        }
+        if started {
+            self.push_undo();
+        }
+        if count != old_count || offset != old_offset {
+            self.objects[active].array_count = count;
+            self.objects[active].array_offset = offset;
+        }
     }
 
     fn mesh_card(&mut self, ui: &mut egui::Ui) {
         let w = tile_width(ui, 5);
         #[derive(Clone, Copy)]
-        enum Act { Extrude, Inset, Bevel, LoopCut, Duplicate, Delete, Flip, MergeFaces, Weld }
+        enum Act { Extrude, Inset, Bevel, LoopCut, Duplicate, Delete, Flip, MergeFaces, Weld, Subdivide, Bridge, Fill }
         let mut act = None;
         let items = [
             (Act::Extrude, Icon::Extrude, "Extrude", "Pull the selected faces out  (E)"),
             (Act::Inset, Icon::Inset, "Inset", "Shrink the selected faces inwards, leaving a rim  (I)"),
-            (Act::Bevel, Icon::Bevel, "Bevel", "Chamfer the selected edges  (Ctrl+B)"),
+            (Act::Bevel, Icon::Bevel, "Bevel", "Chamfer or round the selected edges  (Ctrl+B)\nWhile sizing it, press 1-9 for the number of segments: 1 is a flat chamfer, more make it round."),
             (Act::LoopCut, Icon::LoopCut, "Loop cut", "Cut a ring of faces in two  (Ctrl+R)"),
             (Act::MergeFaces, Icon::MergeFaces, "Join", "Merge adjoining selected faces into one  (M)"),
             (Act::Duplicate, Icon::Duplicate, "Copy", "Duplicate the selection and move it  (Shift+D)"),
             (Act::Delete, Icon::Delete, "Delete", "Delete the selection  (X)"),
             (Act::Flip, Icon::Flip, "Flip", "Flip the selected faces' normals"),
             (Act::Weld, Icon::Weld, "Weld", "Merge vertices that sit on top of each other"),
+            (Act::Subdivide, Icon::Subdivide, "Subdivide", "Split the selected faces evenly: a quad becomes four"),
+            (Act::Bridge, Icon::Bridge, "Bridge", "Join two edge loops with a band of faces.\nIn face mode: select two faces; they are removed and their outlines joined (a tunnel, or a connecting piece)."),
+            (Act::Fill, Icon::FillHole, "Fill", "Close a hole: select the edges (or vertices) around it and a face is made"),
         ];
         for chunk in items.chunks(5) {
             row(ui, |ui| {
@@ -551,6 +594,9 @@ impl App {
                 }
             }
             Some(Act::MergeFaces) => self.merge_selected_faces(),
+            Some(Act::Subdivide) => self.subdivide_selection(),
+            Some(Act::Bridge) => self.bridge_selection(),
+            Some(Act::Fill) => self.fill_selection(),
             Some(Act::Weld) => {
                 self.push_undo();
                 let n = self.mesh_mut().merge_by_distance(1e-4);
@@ -614,6 +660,20 @@ impl App {
             ui.add(egui::DragValue::new(&mut self.uv_padding).range(0..=16).suffix(" px"))
                 .on_hover_text("Empty pixels Unwrap leaves between islands");
         });
+        ui.horizontal(|ui| {
+            if ui.small_button("Copy UVs").on_hover_text("Remember the UVs of the selected faces  ·  Ctrl+C in the 3D view").clicked() {
+                self.copy_uvs();
+            }
+            if ui.add_enabled(!self.uv_clipboard.is_empty(), egui::Button::new("Paste UVs").small())
+                .on_hover_text("Give the selected faces the copied UVs, so identical faces share the same pixels  ·  Ctrl+V in the 3D view")
+                .on_disabled_hover_text("Copy some faces' UVs first")
+                .clicked()
+            {
+                self.paste_uvs();
+            }
+        });
+        ui.checkbox(&mut self.show_density, "Texel density check")
+            .on_hover_text("Tint faces in the 3D view whose pixels per unit differ from the number above.\nBlue: too few pixels, the texture looks stretched there. Red: too many, the pixels look smaller than elsewhere. Untinted faces match.");
         ui.checkbox(&mut self.uv.show_all, "Show unselected faces");
     }
 

@@ -22,7 +22,7 @@ pub struct Mesh {
     pub faces: Vec<Face>,
 }
 
-fn quad_uvs() -> Vec<Vec2> {
+pub(crate) fn quad_uvs() -> Vec<Vec2> {
     vec![Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), Vec2::new(1.0, 1.0), Vec2::new(0.0, 1.0)]
 }
 
@@ -560,7 +560,7 @@ impl Mesh {
     }
 
     /// Map from a directed edge (a -> b) to the face that contains it in that order.
-    fn directed_edge_faces(&self) -> HashMap<(u32, u32), usize> {
+    pub(crate) fn directed_edge_faces(&self) -> HashMap<(u32, u32), usize> {
         let mut map = HashMap::new();
         for (fi, f) in self.faces.iter().enumerate() {
             for i in 0..f.verts.len() {
@@ -658,6 +658,12 @@ impl Mesh {
     /// or more bevelled edges meet. Edges that do not have exactly two faces are
     /// skipped. Returns the indices of the new faces.
     pub fn bevel_edges(&mut self, edges: &BTreeSet<(u32, u32)>, w: f32) -> BTreeSet<usize> {
+        self.bevel_edges_rounded(edges, w, 1)
+    }
+
+    /// Like [`Mesh::bevel_edges`], with the strip split into `segments` bands that follow
+    /// a quarter circle, so the bevel reads as rounded instead of as one flat chamfer.
+    pub fn bevel_edges_rounded(&mut self, edges: &BTreeSet<(u32, u32)>, w: f32, segments: u32) -> BTreeSet<usize> {
         if w <= 0.0 {
             return BTreeSet::new();
         }
@@ -686,7 +692,8 @@ impl Mesh {
 
         // New vertex for every (face, old vertex) corner; corners in the same group share one.
         let mut corner_vertex: HashMap<(usize, u32), u32> = HashMap::new();
-        let mut caps: Vec<(Vec<u32>, Vec2)> = Vec::new();
+        // (ring, uv, true when it closes the hole where three or more bevels meet)
+        let mut caps: Vec<(Vec<u32>, Vec2, bool)> = Vec::new();
         // Extra corners to add to existing faces: (face, position in the original corner list, vertex, uv).
         let mut inserts: Vec<(usize, usize, u32, Vec2)> = Vec::new();
         for &v in &bev_verts {
@@ -774,7 +781,7 @@ impl Mesh {
                         } else {
                             inserts.push((g_first, kf, p2, uv_first));
                             inserts.push((g_last, kl + 1, p1, uv_last));
-                            caps.push((vec![v, p2, p1], orig.faces[g_first].uvs[kf]));
+                            caps.push((vec![v, p2, p1], orig.faces[g_first].uvs[kf], false));
                         }
                         continue;
                     }
@@ -864,12 +871,14 @@ impl Mesh {
                     ring.reverse();
                     // One texel just inside the first face, so the cap is a single flat colour.
                     let (f0, k0) = cs[0];
-                    caps.push((ring, self.faces[f0].uvs[k0]));
+                    caps.push((ring, self.faces[f0].uvs[k0], true));
                 }
             }
         }
 
         let first_new = self.faces.len();
+        // Every strip as built: face index, [A_v, A_u, B_u, B_v] with their UVs, and the edge's old ends.
+        let mut strips: Vec<(usize, [(u32, Vec2); 4], u32, u32)> = Vec::new();
         for &(u, v) in &bev {
             let (fa, fb) = (dir[&(u, v)], dir[&(v, u)]);
             let old_uv = |f: usize, vert: u32| orig.faces[f].uvs[orig.faces[f].verts.iter().position(|&x| x == vert).unwrap()];
@@ -884,16 +893,9 @@ impl Mesh {
                 (corner_vertex[&(fb, u)], old_uv(fa, u)),
                 (corner_vertex[&(fb, v)], old_uv(fa, v)),
             ];
-            let mut verts = Vec::new();
-            let mut uvs = Vec::new();
-            for (vert, uv) in quad {
-                if verts.last() != Some(&vert) && verts.first() != Some(&vert) {
-                    verts.push(vert);
-                    uvs.push(uv);
-                }
-            }
-            if verts.len() >= 3 {
-                self.faces.push(Face { verts, uvs });
+            if let Some(face) = strip_face(&quad) {
+                strips.push((self.faces.len(), quad, u, v));
+                self.faces.push(face);
             }
         }
         // Applied last and from the back, so the corner indices used above stay valid.
@@ -902,9 +904,16 @@ impl Mesh {
             self.faces[f].verts.insert(at, vert);
             self.faces[f].uvs.insert(at, uv);
         }
-        for (ring, uv) in caps {
+        let mut fans = Vec::new();
+        for (ring, uv, fan) in caps {
+            if fan {
+                fans.push(self.faces.len());
+            }
             let uvs = vec![uv; ring.len()];
             self.faces.push(Face { verts: ring, uvs });
+        }
+        if segments > 1 {
+            self.round_bevel(&orig, &strips, &fans, segments as usize);
         }
         let new_faces = (first_new..self.faces.len()).collect();
         self.remove_unused_verts();
@@ -1208,6 +1217,117 @@ impl Mesh {
     }
 }
 
+/// A bevel strip from its four corners, dropping corners that coincide (a strip that tapers to a point).
+fn strip_face(quad: &[(u32, Vec2); 4]) -> Option<Face> {
+    let mut verts = Vec::new();
+    let mut uvs = Vec::new();
+    for &(vert, uv) in quad {
+        if verts.last() != Some(&vert) && verts.first() != Some(&vert) {
+            verts.push(vert);
+            uvs.push(uv);
+        }
+    }
+    (verts.len() >= 3).then_some(Face { verts, uvs })
+}
+
+impl Mesh {
+    /// Second half of a rounded bevel: split every flat strip into `n` bands along a quarter
+    /// circle about the old edge, and give the faces at the strips' ends the extra vertices.
+    fn round_bevel(&mut self, orig: &Mesh, strips: &[(usize, [(u32, Vec2); 4], u32, u32)], fans: &[usize], n: usize) {
+        // Vertices along the arc between two strip corners, listed from the smaller index to the larger.
+        let mut arcs: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+        let mut arc = |m: &mut Mesh, a: u32, b: u32, c: Vec3| -> Vec<u32> {
+            if a == b {
+                return Vec::new();
+            }
+            let k = (a.min(b), a.max(b));
+            let list = arcs.entry(k).or_insert_with(|| {
+                let (pa, pb) = (m.positions[k.0 as usize], m.positions[k.1 as usize]);
+                (1..n).map(|j| {
+                    let phi = j as f32 / n as f32 * std::f32::consts::FRAC_PI_2;
+                    m.positions.push(c + (pa - c) * (1.0 - phi.sin()) + (pb - c) * (1.0 - phi.cos()));
+                    (m.positions.len() - 1) as u32
+                }).collect()
+            }).clone();
+            if a < b { list } else { list.into_iter().rev().collect() }
+        };
+        let mut strip_faces: BTreeSet<usize> = BTreeSet::new();
+        for &(fi, quad, u, v) in strips {
+            let [(av, uv_av), (au, uv_au), (bu, uv_bu), (bv, uv_bv)] = quad;
+            let iu = arc(self, au, bu, orig.positions[u as usize]);
+            let iv = arc(self, av, bv, orig.positions[v as usize]);
+            let at = |list: &[u32], a: u32, b: u32, j: usize| if j == 0 || a == b { a } else if j == n { b } else { list[j - 1] };
+            let mut first = true;
+            for j in 0..n {
+                let (t0, t1) = (j as f32 / n as f32, (j + 1) as f32 / n as f32);
+                let band = [
+                    (at(&iv, av, bv, j), uv_av.lerp(uv_bv, t0)),
+                    (at(&iu, au, bu, j), uv_au.lerp(uv_bu, t0)),
+                    (at(&iu, au, bu, j + 1), uv_au.lerp(uv_bu, t1)),
+                    (at(&iv, av, bv, j + 1), uv_av.lerp(uv_bv, t1)),
+                ];
+                let Some(face) = strip_face(&band) else { continue };
+                if first {
+                    self.faces[fi] = face;
+                    strip_faces.insert(fi);
+                    first = false;
+                } else {
+                    strip_faces.insert(self.faces.len());
+                    self.faces.push(face);
+                }
+            }
+        }
+        // Faces that have a strip's end as one of their edges take the arc's vertices too.
+        let ends: BTreeSet<u32> = arcs.keys().flat_map(|&(a, b)| [a, b]).collect();
+        let mut faces_of: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (fi, f) in self.faces.iter().enumerate() {
+            if strip_faces.contains(&fi) {
+                continue;
+            }
+            for &v in f.verts.iter().filter(|v| ends.contains(v)) {
+                faces_of.entry(v).or_default().push(fi);
+            }
+        }
+        let mut keys: Vec<(u32, u32)> = arcs.keys().copied().collect();
+        keys.sort();
+        for (a, b) in keys {
+            let list = &arcs[&(a, b)];
+            for &fi in faces_of.get(&a).into_iter().flatten() {
+                let f = &mut self.faces[fi];
+                let len = f.verts.len();
+                let Some(k) = (0..len).find(|&k| (f.verts[k], f.verts[(k + 1) % len]) == (a, b) || (f.verts[k], f.verts[(k + 1) % len]) == (b, a)) else { continue };
+                let forward = f.verts[k] == a;
+                let (uv0, uv1) = (f.uvs[k], f.uvs[(k + 1) % len]);
+                let ordered: Vec<u32> = if forward { list.clone() } else { list.iter().rev().copied().collect() };
+                for (j, vert) in ordered.into_iter().enumerate() {
+                    let t = (j + 1) as f32 / n as f32;
+                    f.verts.insert(k + 1 + j, vert);
+                    f.uvs.insert(k + 1 + j, uv0.lerp(uv1, t));
+                }
+            }
+        }
+        // A cap whose outline is now curved is no longer flat: fan it out from its middle.
+        for &ci in fans {
+            let ring = self.faces[ci].verts.clone();
+            let uv = self.faces[ci].uvs[0];
+            if ring.len() <= 3 {
+                continue;
+            }
+            let centre = ring.iter().map(|&v| self.positions[v as usize]).sum::<Vec3>() / ring.len() as f32;
+            let c = self.positions.len() as u32;
+            self.positions.push(centre);
+            for i in 0..ring.len() {
+                let face = Face { verts: vec![ring[i], ring[(i + 1) % ring.len()], c], uvs: vec![uv; 3] };
+                if i == 0 {
+                    self.faces[ci] = face;
+                } else {
+                    self.faces.push(face);
+                }
+            }
+        }
+    }
+}
+
 /// Result of [`Mesh::edge_ring`]: what a loop cut would cross.
 #[derive(Clone, Debug)]
 pub struct EdgeRing {
@@ -1253,7 +1373,7 @@ fn snap_axis(n: Vec3) -> Vec3 {
 }
 
 /// Fit points into the unit square. With `keep_aspect` the longer side fills it.
-fn normalize_points(pts: &[Vec2], keep_aspect: bool) -> Vec<Vec2> {
+pub(crate) fn normalize_points(pts: &[Vec2], keep_aspect: bool) -> Vec<Vec2> {
     let lo = pts.iter().fold(Vec2::splat(f32::MAX), |a, p| a.min(*p));
     let hi = pts.iter().fold(Vec2::splat(f32::MIN), |a, p| a.max(*p));
     let mut size = (hi - lo).max(Vec2::splat(1e-6));
@@ -1263,7 +1383,7 @@ fn normalize_points(pts: &[Vec2], keep_aspect: bool) -> Vec<Vec2> {
     pts.iter().map(|p| (*p - lo) / size).collect()
 }
 
-fn ray_triangle(o: Vec3, d: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+pub(crate) fn ray_triangle(o: Vec3, d: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
     let (e1, e2) = (b - a, c - a);
     let p = d.cross(e2);
     let det = e1.dot(p);

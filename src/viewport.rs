@@ -35,6 +35,8 @@ pub struct Modal {
     readout: String,
     /// True for gizmo drags: confirm on mouse release.
     drag: bool,
+    /// The gizmo handle this drag started from.
+    grabbed: Option<Handle>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -52,11 +54,13 @@ pub struct OpModal {
     edges: BTreeSet<(u32, u32)>,
     start_mouse: Option<Pos2>,
     value: f32,
+    /// Bevel: bands across the strip (1 = a flat chamfer, more = rounded).
+    pub segments: u32,
 }
 
 impl OpModal {
     pub fn new(kind: OpKind, base: Mesh, faces: BTreeSet<usize>, edges: BTreeSet<(u32, u32)>) -> Self {
-        OpModal { kind, base, faces, edges, start_mouse: None, value: 0.0 }
+        OpModal { kind, base, faces, edges, start_mouse: None, value: 0.0, segments: 1 }
     }
 }
 
@@ -89,14 +93,28 @@ pub struct ObjGeom {
     edges: Vec<[Vec3; 2]>,
 }
 
+/// Tint for the texel density check: nothing when the face matches `target` pixels per unit,
+/// blue when it has too few pixels (stretched), red when it has too many.
+fn density_tint(mesh: &Mesh, face: usize, (target, tex): (f32, glam::Vec2)) -> [f32; 4] {
+    let Some(density) = mesh.face_density(face, tex) else { return [0.0; 4] };
+    let off = (density / target.max(1e-3)).max(1e-4).log2();
+    // Within about 5% counts as matching.
+    if off.abs() < 0.07 {
+        return [0.0; 4];
+    }
+    let strength = (0.3 + off.abs() * 0.3).min(0.75);
+    if off < 0.0 { [0.15, 0.4, 1.0, strength] } else { [1.0, 0.2, 0.15, strength] }
+}
+
 impl ObjGeom {
-    fn build(mesh: &Mesh) -> Self {
+    fn build(mesh: &Mesh, density: Option<(f32, glam::Vec2)>) -> Self {
         let mut batch = Batch::default();
         for (fi, face) in mesh.faces.iter().enumerate() {
             let normal = mesh.face_normal(fi);
+            let tint = density.map_or([0.0; 4], |d| density_tint(mesh, fi, d));
             for tri in mesh.triangulate(fi) {
                 for c in tri {
-                    batch.push(mesh.positions[face.verts[c] as usize], normal, face.uvs[c], [0.0; 4]);
+                    batch.push(mesh.positions[face.verts[c] as usize], normal, face.uvs[c], tint);
                 }
             }
         }
@@ -175,6 +193,8 @@ struct Gizmo {
     tips: [Option<Pos2>; 3],
     /// Rotation rings for X, Y, Z as screen polylines; each point says whether it is on the near side.
     rings: [Vec<(Pos2, bool)>; 3],
+    /// Directions the three handles point in (world axes, or the object's own).
+    axes: [Vec3; 3],
 }
 
 /// The part of the gizmo under the cursor.
@@ -226,6 +246,7 @@ impl App {
             start_mouse: None,
             readout: String::new(),
             drag: false,
+            grabbed: None,
         });
     }
 
@@ -259,19 +280,29 @@ impl App {
         Some(self.pivot_of(&pts))
     }
 
+    /// Directions of the X / Y / Z handles: the world's axes, or with "Local axes" on the active object's own.
+    pub fn gizmo_axes(&self) -> [Vec3; 3] {
+        let q = match self.objects.get(self.active) {
+            Some(obj) if self.gizmo_local => pixelmesh::xform::euler_quat(obj.rotation),
+            _ => Quat::IDENTITY,
+        };
+        [q * Vec3::X, q * Vec3::Y, q * Vec3::Z]
+    }
+
     fn gizmo(&self, rect: egui::Rect) -> Option<Gizmo> {
         let pivot = self.selection_pivot()?;
         let centre = self.camera.project(rect, pivot)?;
         let len = self.camera.units_per_pixel(rect, pivot) * ARROW_PX;
         // Origins can only be moved, so "origin only" always shows the arrows.
         let kind = if self.sel_mode == SelMode::Object && self.origin_only { ModalKind::Grab } else { self.gizmo_kind };
-        let tips = AXES.map(|(axis, _, _)| {
+        let axes = self.gizmo_axes();
+        let tips = axes.map(|axis| {
             self.camera.project(rect, pivot + axis * len).filter(|tip| tip.distance(centre) > 14.0)
         });
         let mut rings: [Vec<(Pos2, bool)>; 3] = Default::default();
         if kind == ModalKind::Rotate {
             let toward_viewer = (self.camera.eye() - pivot).normalize_or(self.camera.back());
-            for (i, (axis, _, _)) in AXES.iter().enumerate() {
+            for (i, axis) in axes.iter().enumerate() {
                 let u = axis.any_orthonormal_vector();
                 let v = axis.cross(u);
                 for k in 0..=64 {
@@ -283,7 +314,7 @@ impl App {
                 }
             }
         }
-        Some(Gizmo { kind, centre, tips, rings })
+        Some(Gizmo { kind, centre, tips, rings, axes })
     }
 
     fn update_modal(&mut self, rect: egui::Rect, mouse: Pos2, snap: bool) {
@@ -386,6 +417,13 @@ impl App {
             self.revert_last();
             return;
         }
+        if op.kind == OpKind::Bevel {
+            let digits = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9];
+            if let Some(n) = digits.iter().position(|&k| key(k)) {
+                op.segments = n as u32 + 1;
+                self.bevel_segments = op.segments;
+            }
+        }
         if let Some(mouse) = mouse {
             let start = *op.start_mouse.get_or_insert(mouse);
             // Scale mouse travel by the zoom level at the selection so the feel is the same near and far.
@@ -402,7 +440,7 @@ impl App {
                     mesh.inset_faces(&op.faces, value);
                     op.faces.clone()
                 }
-                OpKind::Bevel => mesh.bevel_edges(&op.edges, value),
+                OpKind::Bevel => mesh.bevel_edges_rounded(&op.edges, value, op.segments),
             };
             // Keep the selection valid for the rebuilt mesh: the inset faces, or the new bevel faces.
             let fallback = if op.kind == OpKind::Inset || value > 0.0 { result_faces } else { BTreeSet::new() };
@@ -527,11 +565,13 @@ impl App {
     }
 
     fn modal_keys(&mut self, ui: &egui::Ui) {
+        let axes = self.gizmo_axes();
         let Some(m) = &mut self.modal else { return };
         let pressed = |k: Key| ui.input(|i| i.key_pressed(k));
         if !m.drag {
-            for (axis, name, _) in AXES {
-                let key = [Key::X, Key::Y, Key::Z][AXES.iter().position(|a| a.1 == name).unwrap()];
+            for (i, (_, name, _)) in AXES.into_iter().enumerate() {
+                let axis = axes[i];
+                let key = [Key::X, Key::Y, Key::Z][i];
                 if pressed(key) {
                     // Pressing the same axis again frees the constraint.
                     if m.axis == Some(axis) {
@@ -557,7 +597,35 @@ impl App {
         }
     }
 
+    /// Keys that only change the view: these also work while painting on the model.
+    fn view_keys(&mut self, ui: &egui::Ui) -> bool {
+        let pressed = |k: Key| ui.input(|i| i.key_pressed(k) && !i.modifiers.command);
+        // 1 / 3 / 7 = front / right / top; with Ctrl (or Cmd) the opposite side: back / left / bottom.
+        let view_key = ui.input(|i| {
+            let opposite = (i.modifiers.ctrl || i.modifiers.command) as usize;
+            [Key::Num1, Key::Num3, Key::Num7].iter().position(|&k| i.key_pressed(k)).map(|n| crate::app::VIEWS[n * 2 + opposite])
+        });
+        if let Some(view) = view_key {
+            self.set_view(view.1, view.2);
+        } else if pressed(Key::Num9) {
+            self.flip_view();
+        } else if pressed(Key::Num5) {
+            self.camera.ortho = !self.camera.ortho;
+            self.auto_ortho = false;
+        } else if pressed(Key::Period) {
+            self.frame_selected();
+        } else if pressed(Key::Home) {
+            self.frame_all();
+        } else {
+            return false;
+        }
+        true
+    }
+
     fn viewport_keys(&mut self, ui: &egui::Ui) {
+        if self.view_keys(ui) {
+            return;
+        }
         let (shift, alt) = ui.input(|i| (i.modifiers.shift, i.modifiers.alt));
         let pressed = |k: Key| ui.input(|i| i.key_pressed(k) && !i.modifiers.command);
         let ctrl = |k: Key| ui.input(|i| i.key_pressed(k) && i.modifiers.command && !i.modifiers.shift);
@@ -583,6 +651,14 @@ impl App {
             self.delete_selection();
         } else if pressed(Key::A) {
             if alt { self.deselect_all() } else { self.select_all() }
+        } else if pressed(Key::H) {
+            if alt {
+                self.show_all();
+            } else if shift {
+                self.isolate_selected();
+            } else {
+                self.hide_selected();
+            }
         } else if pressed(Key::L) {
             self.select_linked();
         } else if pressed(Key::O) {
@@ -607,18 +683,6 @@ impl App {
             self.circle_radius = (self.circle_radius + 5.0).min(300.0);
         } else if pressed(Key::U) {
             self.show_uv = !self.show_uv;
-        } else if pressed(Key::Num1) {
-            (self.camera.yaw, self.camera.pitch) = (0.0, 0.0);
-        } else if pressed(Key::Num3) {
-            (self.camera.yaw, self.camera.pitch) = (std::f32::consts::FRAC_PI_2, 0.0);
-        } else if pressed(Key::Num7) {
-            (self.camera.yaw, self.camera.pitch) = (0.0, 1.5707);
-        } else if pressed(Key::Num5) {
-            self.camera.ortho = !self.camera.ortho;
-        } else if pressed(Key::Period) {
-            self.frame_selected();
-        } else if pressed(Key::Home) {
-            self.frame_all();
         }
     }
 
@@ -878,6 +942,7 @@ impl App {
         grid.line(Vec3::new(0.0, 0.0, -8.0), Vec3::new(0.0, 0.0, 8.0), [0.3, 0.5, 0.95, 0.7]);
 
         let object_mode = self.sel_mode == SelMode::Object;
+        let density = self.show_density.then(|| (self.px_per_unit, self.tex_size()));
         // Which objects are drawn from the cache: everything except the one being edited.
         let edited = (!object_mode).then_some(self.active);
         let mut in_use: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -886,10 +951,13 @@ impl App {
             if !obj.visible || edited == Some(i) {
                 continue;
             }
-            let fp = obj.display_key();
+            let mut fp = obj.display_key();
+            if let Some((ppu, tex)) = density {
+                fp = mix(mix(mix(fp, 0xD15), ppu.to_bits() as u64), (tex.x as u64) << 20 | tex.y as u64);
+            }
             in_use.insert(fp);
             cached.push((i, fp));
-            self.geom_cache.entry(fp).or_insert_with(|| Arc::new(ObjGeom::build(&obj.display_mesh())));
+            self.geom_cache.entry(fp).or_insert_with(|| Arc::new(ObjGeom::build(&obj.display_mesh(), density)));
         }
         self.geom_cache.retain(|fp, _| in_use.contains(fp));
 
@@ -931,7 +999,11 @@ impl App {
             let face_mode = self.sel_mode == SelMode::Face;
             for (fi, face) in mesh.faces.iter().enumerate() {
                 let normal = mesh.face_normal(fi);
-                let tint = if face_mode && self.sel_faces.contains(&fi) { [1.0, 0.55, 0.1, 0.35] } else { [0.0; 4] };
+                let tint = if face_mode && self.sel_faces.contains(&fi) {
+                    [1.0, 0.55, 0.1, 0.35]
+                } else {
+                    density.map_or([0.0; 4], |d| density_tint(mesh, fi, d))
+                };
                 for tri in mesh.triangulate(fi) {
                     for c in tri {
                         tris.push(mesh.positions[face.verts[c] as usize], normal, face.uvs[c], tint);
@@ -954,8 +1026,8 @@ impl App {
                 }
                 lines.line(pa, pb, c);
             }
-            // The mirrored half follows along while editing, but is not itself editable.
-            if obj.has_mirror() {
+            // The mirrored / repeated copies follow along while editing, but are not themselves editable.
+            if obj.has_modifiers() {
                 let full = obj.display_mesh();
                 for (fi, face) in full.faces.iter().enumerate().skip(mesh.faces.len()) {
                     let normal = full.face_normal(fi);
@@ -1021,6 +1093,11 @@ impl App {
             if mods.shift {
                 self.camera.pan(d.x, d.y, rect.height());
             } else {
+                // Orbiting out of an axis view goes back to perspective, if the shortcut was what switched it off.
+                if self.auto_ortho && d != egui::Vec2::ZERO {
+                    self.camera.ortho = false;
+                    self.auto_ortho = false;
+                }
                 self.camera.orbit(d.x, d.y);
             }
         }
@@ -1033,7 +1110,10 @@ impl App {
         let snap = self.snap_on != mods.command;
         // While the UV editor is running a keyboard move / scale, keys belong to it.
         let keyboard_free = !ui.ctx().egui_wants_keyboard_input() && !self.uv.is_modal();
-        let gizmo_before = if self.show_gizmo && !self.busy() { self.gizmo(rect) } else { None };
+        // With "Paint on model" the left button paints, so there is nothing to select or drag.
+        let painting = self.painting_on_model() && !was_busy;
+        let mut paint_hover = None;
+        let gizmo_before = if self.show_gizmo && !self.busy() && !painting { self.gizmo(rect) } else { None };
         let gizmo_kind = gizmo_before.as_ref().map(|g| g.kind);
         let over_gizmo = |p: Option<Pos2>| gizmo_before.as_ref().zip(p).and_then(|(g, p)| g.hit(p));
 
@@ -1056,6 +1136,13 @@ impl App {
         } else if self.loop_cut.is_some() {
             preview = self.loop_cut_step(ui, &resp, rect, mouse, snap, keyboard_free);
             ui.ctx().request_repaint();
+        } else if painting {
+            if resp.hovered() && keyboard_free {
+                if !self.view_keys(ui) {
+                    self.paint_tool_keys(ui);
+                }
+            }
+            paint_hover = self.paint_on_model(ui, &resp, rect, mouse, mods);
         } else {
             if resp.hovered() && keyboard_free {
                 self.viewport_keys(ui);
@@ -1084,11 +1171,13 @@ impl App {
                         Handle::Axis(i) => Some(i),
                         Handle::Centre => None,
                     };
-                    self.start_modal(kind, axis.map(|i| AXES[i].0));
+                    let axes = self.gizmo_axes();
+                    self.start_modal(kind, axis.map(|i| axes[i]));
                     if let Some(m) = &mut self.modal {
                         m.axis_name = axis.map_or("", |i| AXES[i].1);
                         m.start_mouse = press;
                         m.drag = true;
+                        m.grabbed = Some(handle);
                     }
                 }
             } else if resp.clicked_by(PointerButton::Primary) && grabbed.is_none() {
@@ -1131,7 +1220,7 @@ impl App {
         }
 
         // ---- right-click menu (not while a tool is running: there right-click cancels)
-        if !was_busy {
+        if !was_busy && !painting {
             if resp.secondary_clicked() {
                 if let Some(pos) = resp.interact_pointer_pos() {
                     self.pick_for_menu(rect, pos);
@@ -1141,6 +1230,7 @@ impl App {
         }
 
         // ---- draw scene
+        self.draw_references(&painter, rect, false);
         if let Some(renderer) = self.renderer.clone() {
             let frame = Arc::new(self.build_frame(rect));
             painter.add(egui::PaintCallback {
@@ -1150,13 +1240,11 @@ impl App {
                 })),
             });
         }
+        self.draw_references(&painter, rect, true);
 
         // ---- draw gizmo on top (recomputed so it follows the selection while dragging)
-        let dragging = self.modal.as_ref().filter(|m| m.drag).map(|m| match AXES.iter().position(|a| Some(a.0) == m.axis) {
-            Some(i) => Handle::Axis(i),
-            None => Handle::Centre,
-        });
-        let show = self.show_gizmo && self.modal.as_ref().is_none_or(|m| m.drag) && self.op.is_none() && self.loop_cut.is_none();
+        let dragging = self.modal.as_ref().filter(|m| m.drag).map(|m| m.grabbed.unwrap_or(Handle::Centre));
+        let show = self.show_gizmo && !painting && self.modal.as_ref().is_none_or(|m| m.drag) && self.op.is_none() && self.loop_cut.is_none();
         if let Some(mut g) = show.then(|| self.gizmo(rect)).flatten() {
             // While dragging, keep showing the handle type that was grabbed.
             if let Some(m) = self.modal.as_ref().filter(|m| m.drag) {
@@ -1167,7 +1255,7 @@ impl App {
             // Far handles first so near ones overlap them.
             let back = self.camera.back();
             let mut order = [0, 1, 2];
-            order.sort_by(|&a, &b| AXES[a].0.dot(back).total_cmp(&AXES[b].0.dot(back)));
+            order.sort_by(|&a, &b| g.axes[a].dot(back).total_cmp(&g.axes[b].dot(back)));
             for i in order {
                 if dragging.is_some_and(|d| d != Handle::Axis(i)) {
                     continue;
@@ -1257,7 +1345,11 @@ impl App {
         let font = egui::FontId::proportional(13.0);
         let snap_note = if snap { format!("   snap {}", self.grid_snap) } else { String::new() };
         let tool_hint = if let Some(op) = &self.op {
-            let what = if op.kind == OpKind::Inset { "Inset" } else { "Bevel" };
+            let what = if op.kind == OpKind::Inset {
+                "Inset".to_string()
+            } else {
+                format!("Bevel ({} segment{}, [1-9] to change)", op.segments, if op.segments == 1 { "" } else { "s" })
+            };
             Some(format!("{what}:  {:.3}{snap_note}    move the mouse right for more   [Ctrl] flip snap   [Click/Enter] confirm   [Esc/Right-click] cancel", op.value))
         } else if let Some(lc) = &self.loop_cut {
             Some(if lc.slide.is_some() {
@@ -1285,6 +1377,7 @@ impl App {
                 }
             }
             None => match self.sel_mode {
+                _ if painting => "Paint on model: left button paints · right / middle button orbits · untick it in the Paint tab to select again",
                 _ if self.select_tool == SelectTool::Box => "Drag a box to select · Shift add · Ctrl remove · Q back to click select",
                 _ if self.select_tool == SelectTool::Circle => "Paint with the circle to select · Shift add · Ctrl remove · [ ] radius · Q back to click select",
                 SelMode::Object if self.origin_only => "Origin mode: drag an arrow or press G to move only the origin (orange ring) · click the Origin tile to leave",
@@ -1300,7 +1393,13 @@ impl App {
             SelMode::Face => "Face mode",
         };
         let name = self.objects.get(self.active).map_or("no object", |o| o.name.as_str());
-        let proj = if self.camera.ortho { "Ortho" } else { "Perspective" };
+        let proj = match (self.view_name(), self.camera.ortho) {
+            (Some(view), true) => format!("{view} · Ortho"),
+            (Some(view), false) => format!("{view} · Perspective"),
+            (None, true) => "Ortho".to_string(),
+            (None, false) => "Perspective".to_string(),
+        };
+
         let name = if self.sel_mode == SelMode::Object && self.sel_objects.len() != 1 {
             format!("{} objects selected", self.sel_objects.len())
         } else {
@@ -1311,8 +1410,54 @@ impl App {
             SelectTool::Box => " · Box select",
             SelectTool::Circle => " · Circle select",
         };
-        let snap_txt = if self.snap_on { format!(" · Snap {}", self.grid_snap) } else { String::new() };
+        let mut snap_txt = if self.snap_on { format!(" · Snap {}", self.grid_snap) } else { String::new() };
+        if self.gizmo_local {
+            snap_txt += " · Local axes";
+        }
+        // Less permanent states go on a second line, clear of the view buttons.
+        let mut notes: Vec<String> = Vec::new();
+        if painting {
+            notes.push(match paint_hover {
+                Some((x, y)) => format!("Paint on model · pixel {x}, {y}"),
+                None => "Paint on model".to_string(),
+            });
+        }
+        if self.show_density {
+            notes.push("Density check: blue = too few pixels, red = too many".to_string());
+        }
+        let hidden = self.objects.iter().filter(|o| !o.visible).count();
+        if hidden > 0 {
+            notes.push(format!("{hidden} hidden (Alt+H shows all)"));
+        }
+        if !notes.is_empty() {
+            painter.text(rect.left_top() + egui::vec2(8.0, 26.0), egui::Align2::LEFT_TOP, notes.join(" · "), font.clone(), Color32::from_rgb(255, 200, 130));
+        }
         painter.text(rect.left_top() + egui::vec2(8.0, 8.0), egui::Align2::LEFT_TOP, format!("{mode} · {name} · {proj}{tool}{snap_txt}"), font, Color32::from_gray(200));
+
+        // ---- view buttons, top right
+        let current = self.view_name();
+        let bar = egui::Rect::from_min_max(egui::pos2(rect.right() - 372.0, rect.top() + 6.0), egui::pos2(rect.right() - 6.0, rect.top() + 28.0));
+        let mut chosen = None;
+        let mut toggle_ortho = false;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(bar).layout(egui::Layout::right_to_left(egui::Align::Center)), |ui| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            ui.add_enabled_ui(!was_busy, |ui| {
+                toggle_ortho = ui.selectable_label(self.camera.ortho, "Ortho").on_hover_text("Orthographic (no perspective)  ·  5").clicked();
+                ui.add_space(6.0);
+                for (view, tip) in crate::app::VIEWS.iter().zip(["1", "Ctrl+1", "3", "Ctrl+3", "7", "Ctrl+7"]).rev() {
+                    if ui.selectable_label(current == Some(view.0), view.0).on_hover_text(format!("{} view  ·  {tip}", view.0)).clicked() {
+                        chosen = Some(*view);
+                    }
+                }
+            });
+        });
+        if let Some(view) = chosen {
+            self.set_view(view.1, view.2);
+        }
+        if toggle_ortho {
+            self.camera.ortho = !self.camera.ortho;
+            self.auto_ortho = false;
+        }
     }
 }
 

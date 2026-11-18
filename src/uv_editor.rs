@@ -162,6 +162,29 @@ fn combine(base: &BTreeSet<Corner>, hits: &BTreeSet<Corner>, op: Op) -> BTreeSet
     }
 }
 
+/// Grow a set of faces to their whole UV islands: faces count as connected when they share a UV point.
+fn uv_island(face_uvs: &std::collections::BTreeMap<usize, Vec<Vec2>>, seeds: BTreeSet<usize>) -> BTreeSet<usize> {
+    let quantise = |uv: Vec2| ((uv.x * 65536.0).round() as i64, (uv.y * 65536.0).round() as i64);
+    let mut at_point: std::collections::HashMap<(i64, i64), Vec<usize>> = std::collections::HashMap::new();
+    for (&f, uvs) in face_uvs {
+        for &uv in uvs {
+            at_point.entry(quantise(uv)).or_default().push(f);
+        }
+    }
+    let mut out: BTreeSet<usize> = seeds.into_iter().filter(|f| face_uvs.contains_key(f)).collect();
+    let mut stack: Vec<usize> = out.iter().copied().collect();
+    while let Some(f) = stack.pop() {
+        for &uv in &face_uvs[&f] {
+            for &g in &at_point[&quantise(uv)] {
+                if out.insert(g) {
+                    stack.push(g);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn bounds(points: impl Iterator<Item = Vec2>) -> Option<(Vec2, Vec2)> {
     points.fold(None, |acc, p| match acc {
         None => Some((p, p)),
@@ -208,6 +231,7 @@ impl App {
 
     pub fn uv_editor(&mut self, ui: &mut egui::Ui) {
         let active = self.active_faces();
+        let mut linked_clicked = false;
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.uv.mode, UvMode::Vertex, "Vertex (V)");
             ui.selectable_value(&mut self.uv.mode, UvMode::Face, "Face (F)");
@@ -224,6 +248,7 @@ impl App {
             if ui.small_button("Fit view").clicked() {
                 self.uv.fit_view();
             }
+            linked_clicked = ui.small_button("Linked").on_hover_text("Grow the selection to whole islands: everything connected to it.\nL does the same for the island under the mouse (Shift+L adds it).").clicked();
         });
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = resp.rect;
@@ -352,7 +377,16 @@ impl App {
         let mut action = Action::None;
 
         if self.uv.drag.is_none() {
-            if resp.hovered() {
+            if linked_clicked || (resp.hovered() && key(Key::L)) {
+                // The island under the mouse, or failing that the islands of the current selection.
+                let under = resp.hover_pos().filter(|_| !linked_clicked).and_then(|p| {
+                    face_at(p).map(|f| BTreeSet::from([f])).or_else(|| point_at(p).map(|uv| same_uv(uv).iter().map(|c| c.0).collect()))
+                });
+                let seeds: BTreeSet<usize> = under.clone().unwrap_or_else(|| self.uv.sel.iter().map(|c| c.0).collect());
+                let hits: BTreeSet<Corner> = uv_island(&face_uvs, seeds).into_iter().flat_map(face_corners).collect();
+                let add = mods.shift && under.is_some();
+                action = Action::Select(if add { combine(&self.uv.sel, &hits, Op::Add) } else { hits });
+            } else if resp.hovered() {
                 if key(Key::V) {
                     self.uv.mode = UvMode::Vertex;
                 } else if key(Key::F) {

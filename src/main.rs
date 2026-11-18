@@ -4,6 +4,7 @@ mod app;
 mod camera;
 mod paint;
 mod render;
+mod scene;
 mod sidebar;
 mod uv_editor;
 mod viewport;
