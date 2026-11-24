@@ -1,6 +1,6 @@
 [package]
 name = "pixelmesh"
-version = "0.2.0"
+version = "0.2.2"
 edition = "2021"
 description = "A slimmed-down low-poly mesh editor with pixel-art UV mapping and FBX export"
 
@@ -13,6 +13,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # FBX parser used for import (a small C library; needs a C compiler at build time).
 ufbx = "0.11"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# For receiving files opened from Finder; the same versions winit already pulls in.
+objc2 = "0.5"
+objc2-foundation = { version = "0.2", features = ["NSArray", "NSURL", "NSString"] }
 
 [profile.dev]
 opt-level = 1

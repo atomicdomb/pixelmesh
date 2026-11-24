@@ -63,6 +63,48 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSApplicationCategoryType</key><string>public.app-category.graphics-design</string>
     <key>NSHighResolutionCapable</key><true/>
     $ICON_KEY
+    <!-- File types: double-clicking a .pmesh opens it here; .fbx files offer PixelMesh under "Open With". -->
+    <key>CFBundleDocumentTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeName</key><string>PixelMesh Project</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Owner</string>
+            <key>LSItemContentTypes</key><array><string>$BUNDLE_ID.project</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>FBX Model</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>Alternate</string>
+            <key>LSItemContentTypes</key><array><string>com.autodesk.fbx</string></array>
+        </dict>
+        <dict>
+            <key>CFBundleTypeName</key><string>Image</string>
+            <key>CFBundleTypeRole</key><string>Editor</string>
+            <key>LSHandlerRank</key><string>None</string>
+            <key>LSItemContentTypes</key><array><string>public.png</string><string>public.jpeg</string><string>com.microsoft.bmp</string><string>com.truevision.tga-image</string></array>
+        </dict>
+    </array>
+    <key>UTExportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key><string>$BUNDLE_ID.project</string>
+            <key>UTTypeDescription</key><string>PixelMesh Project</string>
+            <key>UTTypeConformsTo</key><array><string>public.data</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>pmesh</string></array></dict>
+        </dict>
+    </array>
+    <key>UTImportedTypeDeclarations</key>
+    <array>
+        <dict>
+            <key>UTTypeIdentifier</key><string>com.autodesk.fbx</string>
+            <key>UTTypeDescription</key><string>FBX Model</string>
+            <key>UTTypeConformsTo</key><array><string>public.data</string></array>
+            <key>UTTypeTagSpecification</key>
+            <dict><key>public.filename-extension</key><array><string>fbx</string></array></dict>
+        </dict>
+    </array>
 </dict>
 </plist>
 PLIST

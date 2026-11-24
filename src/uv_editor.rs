@@ -40,6 +40,8 @@ enum DragKind {
     Scale { pivot: Vec2, half: Vec2 },
     /// Dragging a scale arrow: stretch along one axis (0 = U, 1 = V) about the selection's centre.
     Axis { pivot: Vec2, half: Vec2, axis: usize },
+    /// R key or the round handle above the frame: turn about `pivot`.
+    Rotate { pivot: Vec2 },
 }
 
 struct Drag {
@@ -211,6 +213,40 @@ impl App {
         self.uv.drag = Some(Drag { kind, corners, anchor, start, modal, lock: None, readout: String::new() });
     }
 
+    /// Turn the selected UVs a quarter turn about their middle (`turns` = 1 is anticlockwise).
+    /// Measured in pixels, so shapes keep their proportions on a texture that is not square.
+    pub fn uv_rotate_quarter(&mut self, turns: i32) {
+        let Some((lo, hi)) = self.uv_sel_bounds().filter(|_| self.uv.sel.len() > 1) else {
+            self.status = "Rotate: select the UV vertices or faces to turn first.".into();
+            return;
+        };
+        let tex = self.tex_size();
+        let pivot = (lo + hi) * 0.5;
+        let (sin, cos) = match turns.rem_euclid(4) {
+            1 => (1.0, 0.0),
+            2 => (0.0, -1.0),
+            3 => (-1.0, 0.0),
+            _ => (0.0, 1.0),
+        };
+        let snap = self.uv.snap;
+        let targets: Vec<Corner> = self.uv.sel.iter().copied().collect();
+        self.push_undo();
+        let mesh = self.mesh_mut();
+        for &(f, k) in &targets {
+            let d = (mesh.faces[f].uvs[k] - pivot) * tex;
+            mesh.faces[f].uvs[k] = pivot + Vec2::new(d.x * cos - d.y * sin, d.x * sin + d.y * cos) / tex;
+        }
+        if snap {
+            // A box an odd number of pixels wider than tall ends up half a pixel off the grid: nudge it back on.
+            if let Some((new_lo, _)) = bounds(targets.iter().map(|&(f, k)| mesh.faces[f].uvs[k])) {
+                let shift = (new_lo * tex).round() / tex - new_lo;
+                for &(f, k) in &targets {
+                    mesh.faces[f].uvs[k] += shift;
+                }
+            }
+        }
+    }
+
     /// Round the selected UVs (or all shown ones when nothing is selected) to texture pixel corners.
     fn uv_snap_to_pixels(&mut self, active: &BTreeSet<usize>) {
         let tex = self.tex_size();
@@ -249,6 +285,21 @@ impl App {
                 self.uv.fit_view();
             }
             linked_clicked = ui.small_button("Linked").on_hover_text("Grow the selection to whole islands: everything connected to it.\nL does the same for the island under the mouse (Shift+L adds it).").clicked();
+        });
+        ui.horizontal(|ui| {
+            ui.label("Rotate");
+            ui.add_enabled_ui(self.uv.sel.len() > 1 && self.uv.drag.is_none(), |ui| {
+                if ui.small_button("Left 90°").on_hover_text("Turn the selected UVs a quarter turn anticlockwise about their middle").clicked() {
+                    self.uv_rotate_quarter(1);
+                }
+                if ui.small_button("Right 90°").on_hover_text("Turn the selected UVs a quarter turn clockwise about their middle").clicked() {
+                    self.uv_rotate_quarter(-1);
+                }
+                if ui.small_button("180°").clicked() {
+                    self.uv_rotate_quarter(2);
+                }
+            });
+            ui.weak("R or the round handle: any angle");
         });
         let (resp, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let rect = resp.rect;
@@ -339,6 +390,10 @@ impl App {
             }
         }
         let handle_at = |pos: Pos2| handles.iter().find(|h| h.0.distance(pos) <= 8.0).copied();
+        // Rotation handle: a round knob on a short stalk above the frame.
+        const STALK: f32 = 24.0;
+        let knob = frame.filter(|_| self.uv.drag.is_none()).map(|f| Pos2::new(f.center().x, f.top() - STALK));
+        let knob_at = |pos: Pos2| knob.is_some_and(|k| k.distance(pos) <= 9.0);
 
         // Scale arrows from the middle of the selection: U to the right, V upwards. Each stretches one axis only.
         const ARROW: f32 = 46.0;
@@ -409,6 +464,9 @@ impl App {
                 } else if let (true, Some((lo, hi))) = (key(Key::S), sel_bounds) {
                     let kind = DragKind::Scale { pivot: (lo + hi) * 0.5, half: (hi - lo) * 0.5 };
                     action = Action::StartDrag { select: None, kind, anchor: lo, start: None, modal: true };
+                } else if let (true, Some((lo, hi)), true) = (key(Key::R), sel_bounds, self.uv.sel.len() > 1) {
+                    let kind = DragKind::Rotate { pivot: (lo + hi) * 0.5 };
+                    action = Action::StartDrag { select: None, kind, anchor: lo, start: None, modal: true };
                 }
             }
 
@@ -416,7 +474,10 @@ impl App {
             if let (true, Some(start)) = (resp.drag_started_by(PointerButton::Primary), press) {
                 let element = element_at(start);
                 let selected = element.as_ref().is_some_and(|e| e.is_subset(&self.uv.sel));
-                if let (Some(axis), Some((lo, hi))) = (arrow_at(start), sel_bounds) {
+                if let (true, Some((lo, hi))) = (knob_at(start), sel_bounds) {
+                    let kind = DragKind::Rotate { pivot: (lo + hi) * 0.5 };
+                    action = Action::StartDrag { select: None, kind, anchor: lo, start: Some(start), modal: false };
+                } else if let (Some(axis), Some((lo, hi))) = (arrow_at(start), sel_bounds) {
                     let kind = DragKind::Axis { pivot: (lo + hi) * 0.5, half: (hi - lo) * 0.5, axis };
                     action = Action::StartDrag { select: None, kind, anchor: lo, start: Some(start), modal: false };
                 } else if let Some((_, at, anchor, axes)) = handle_at(start) {
@@ -513,8 +574,24 @@ impl App {
                 let delta = to_uv(mouse) - to_uv(start);
                 let snap_px = |p: Vec2| (p * tex).round() / tex;
                 let keep = |axis: usize| drag.lock.is_none_or(|l| l == axis);
-                // Every transform is "anchor + (orig - anchor) * scale + shift".
+                // Every transform is "anchor + turned((orig - anchor) * scale) + shift".
+                let mut angle = 0.0f32;
                 let (pivot, scale, shift) = match drag.kind {
+                    DragKind::Rotate { pivot } => {
+                        let centre = to_screen(pivot);
+                        let dir = |p: Pos2| (p.y - centre.y).atan2(p.x - centre.x);
+                        // Screen Y runs downwards, so a clockwise drag is a negative turn in UV space.
+                        let mut turn = -(dir(mouse) - dir(start));
+                        turn = (turn + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI;
+                        if mods.command || mods.shift {
+                            // Ctrl: steps of 15 degrees. Shift: quarter turns.
+                            let step = if mods.shift { 90.0f32 } else { 15.0f32 }.to_radians();
+                            turn = (turn / step).round() * step;
+                        }
+                        angle = turn;
+                        drag.readout = format!("Rotate {:+.1}°", turn.to_degrees());
+                        (pivot, Vec2::ONE, Vec2::ZERO)
+                    }
                     DragKind::Move => {
                         let mut d = delta;
                         if self.uv.snap {
@@ -582,7 +659,14 @@ impl App {
                 let mesh = self.mesh_mut();
                 for &(f, k, orig) in &drag.corners {
                     if f < mesh.faces.len() && k < mesh.faces[f].uvs.len() {
-                        mesh.faces[f].uvs[k] = pivot + (orig - pivot) * scale + shift;
+                        let mut d = (orig - pivot) * scale;
+                        if angle != 0.0 {
+                            // Turn in pixel space, so proportions survive a texture that is not square.
+                            let (sin, cos) = angle.sin_cos();
+                            let px = d * tex;
+                            d = Vec2::new(px.x * cos - px.y * sin, px.x * sin + px.y * cos) / tex;
+                        }
+                        mesh.faces[f].uvs[k] = pivot + d + shift;
                     }
                 }
             }
@@ -678,6 +762,15 @@ impl App {
                 painter.rect_filled(square, 1.0, if hot { Color32::WHITE } else { bright });
                 painter.rect_stroke(square, 1.0, Stroke::new(1.0, Color32::BLACK), egui::StrokeKind::Middle);
             }
+            // Rotation knob.
+            if let Some(k) = knob {
+                let hot = hover.is_some_and(|h| knob_at(h));
+                over_handle |= hot;
+                let top = Pos2::new(r.center().x, r.top());
+                painter.line_segment([top, k], Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 245, 170, 150)));
+                painter.circle_filled(k, if hot { 7.0 } else { 5.5 }, if hot { Color32::WHITE } else { Color32::from_rgb(110, 190, 255) });
+                painter.circle_stroke(k, if hot { 7.0 } else { 5.5 }, Stroke::new(1.0, Color32::BLACK));
+            }
             // One-axis scale arrows.
             for &(axis, c, tip) in &arrows {
                 let hot = hover.is_some_and(|h| arrow_at(h) == Some(axis));
@@ -727,13 +820,18 @@ impl App {
                     Some(1) => "  (V only)",
                     _ => "",
                 };
-                format!("{}{lock}    [X/Y] lock axis   [Click/Enter] confirm   [Esc/Right-click] cancel", d.readout)
+                if matches!(d.kind, DragKind::Rotate { .. }) {
+                    format!("{}   [Ctrl] 15°  [Shift] 90°  [Click] confirm  [Esc] cancel", d.readout)
+                } else {
+                    format!("{}{lock}    [X/Y] lock axis   [Click/Enter] confirm   [Esc/Right-click] cancel", d.readout)
+                }
             }
+            Some(d) if matches!(d.kind, DragKind::Rotate { .. }) => format!("{}   [Ctrl] 15° steps  [Shift] 90° steps", d.readout),
             Some(d) => d.readout.clone(),
             None => match resp.hover_pos() {
                 Some(p) => {
                     let uv = to_uv(p);
-                    format!("px {:.0}, {:.0}    drag in the frame to move · arrows scale one axis · handles or S scale", (uv.x * tex.x).floor(), ((1.0 - uv.y) * tex.y).floor())
+                    format!("px {:.0}, {:.0}    drag in frame: move · handles / S: scale · knob / R: rotate", (uv.x * tex.x).floor(), ((1.0 - uv.y) * tex.y).floor())
                 }
                 None => String::new(),
             },

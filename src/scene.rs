@@ -811,6 +811,51 @@ impl App {
         self.finish_face_op(result, "Bridge");
     }
 
+    /// The vertices "make face" would use: the selected ones, or the ends of the selected edges.
+    fn face_candidates(&self) -> BTreeSet<u32> {
+        match self.sel_mode {
+            SelMode::Vertex => self.sel_verts.clone(),
+            SelMode::Edge => self.sel_edges.iter().flat_map(|&(a, b)| [a, b]).collect(),
+            _ => BTreeSet::new(),
+        }
+    }
+
+    /// True when F should make a face instead of switching to face mode:
+    /// three or more vertices are selected and they are not a face already.
+    pub fn can_make_face(&self) -> bool {
+        let verts = self.face_candidates();
+        verts.len() >= 3 && !self.mesh().faces.iter().any(|f| f.verts.len() == verts.len() && f.verts.iter().all(|v| verts.contains(v)))
+    }
+
+    /// Make a face from the selected vertices.
+    pub fn make_face(&mut self) {
+        if !matches!(self.sel_mode, SelMode::Vertex | SelMode::Edge) {
+            self.status = "Make face works in vertex or edge mode: select three or more vertices, then F.".into();
+            return;
+        }
+        let verts = self.face_candidates();
+        let toward = self.camera.back();
+        self.push_undo();
+        let result = self.mesh_mut().face_from_verts(&verts, toward).map(|f| BTreeSet::from([f]));
+        self.finish_face_op(result, "Make face");
+    }
+
+    /// Knife: click points on edges; each click cuts the face between it and the last one.
+    pub fn start_knife(&mut self) {
+        if self.sel_mode == SelMode::Object {
+            self.status = "The knife works in an edit mode: press Tab first.".into();
+            return;
+        }
+        if self.busy() {
+            return;
+        }
+        self.push_undo();
+        self.sel_verts.clear();
+        self.sel_edges.clear();
+        self.sel_faces.clear();
+        self.knife = Some(crate::viewport::Knife::default());
+    }
+
     /// Close the hole outlined by the selected edges with a new face.
     pub fn fill_selection(&mut self) {
         if self.sel_mode == SelMode::Object {

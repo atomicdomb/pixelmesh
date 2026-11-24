@@ -38,6 +38,21 @@ Then each time:
 Send the zip from `dist/`. The bundle identifier defaults to
 `studio.butterflyknights.pixelmesh`; set `BUNDLE_ID` to use another.
 
+### Opening files from Finder
+
+The packaged app registers itself for its file types: double-clicking a
+`.pmesh` project opens it in PixelMesh, and `.fbx` files (and PNG / JPEG /
+BMP / TGA images) list PixelMesh under right-click > Open With. Dropping a
+file on the Dock icon works too, also while PixelMesh is already running.
+An FBX opened into the untouched start-up scene replaces the default cube;
+otherwise it is imported into the current scene. To make PixelMesh the
+default for FBX, use Finder's Get Info > Open with > Change All.
+
+This only applies to the app bundle made by `scripts/macos-package.sh`; a
+bare `cargo run` binary has no file types. After installing a new build,
+macOS can take a moment to notice the file types; opening the app once
+from its final location (for example /Applications) registers them.
+
 ## Layout
 
 | Area   | What it does |
@@ -204,6 +219,12 @@ two by hand, and then it stays as you set it.
 
 "Front" shows the side of the model that faces +Z, the blue axis.
 
+In the straight-on front, back, right and left views the grid stands
+upright facing you (one square = one unit, with the red X or blue Z axis
+along the ground and the green Y axis up the middle) instead of lying on
+the ground where it would only be a line. It is drawn behind the model and
+follows the view as you pan. Orbiting away brings the ground grid back.
+
 ## Inset, bevel, loop cut
 
 All three work on the object being edited (Tab into vertex / face mode first).
@@ -221,8 +242,15 @@ All three work on the object being edited (Tab into vertex / face mode first).
   to place. A single cut can then be slid along the edge; click again to
   confirm. The new loop is left selected in vertex mode.
 
-Inset and bevel are sized by moving the mouse to the right; click or Enter
-confirms, Esc or right-click cancels. Snapping ("Snap every" / Ctrl) applies
+There are two ways to start an inset or bevel:
+
+- **From the Mesh card**: clicking the Inset or Bevel tile only picks the
+  tool (the tile stays lit and nothing changes yet). Then press in the 3D
+  view, drag to the right for more, and release to confirm. Esc or a
+  right-click puts the tool away.
+- **From the keyboard (I, Ctrl+B) or the right-click menu**: it starts at
+  once under the mouse; move right for more, click or Enter confirms, Esc
+  or right-click cancels. Snapping ("Snap every" / Ctrl) applies
 to the inset and bevel width and to the loop-cut slide distance. Existing
 faces keep their texture exactly in place through all three.
 
@@ -252,6 +280,29 @@ and scale handles along the active object's own axes instead of the
 world's, and makes X / Y / Z during G, R, S lock to those axes. It matters
 once an object has been rotated.
 
+## Knife, and making a face
+
+- **Knife (K, or the Knife tile)**: click a point on an edge, then a point
+  on another edge of the same face, and the face is cut between them. Keep
+  clicking to carry the cut on from the last point. Close to a vertex the
+  cut snaps to it; Ctrl snaps to the middle of an edge. Enter or a
+  right-click finishes, Esc throws the cuts away. Points have to be on
+  edges or vertices; to get a point inside a face, cut to it in two steps
+  or subdivide first.
+- **Make face (F, or the Face tile)**: in vertex or edge mode, select three
+  or more vertices and a face is made from them. It follows existing edges
+  between them when there are any, faces the same way as its neighbours,
+  and otherwise faces you. F only does this when the selected vertices
+  could become a face; with fewer than three selected (or when they already
+  are a face) F switches to face mode as before.
+
+## X-ray
+
+The X-ray button at the top right of the 3D view (Alt+Z, or View > X-ray)
+makes faces see-through. Edges and vertices behind them show, and can be
+clicked, box-selected and circle-selected through the mesh. Faces are still
+picked front-most.
+
 ## 3D viewport
 
 | Input | Action |
@@ -268,6 +319,10 @@ once an object has been rotated.
 | Ctrl+J | Merge selected objects |
 | A / Alt+A / L | Select all / none / linked (edit modes) |
 | G / R / S | Move / rotate / scale. Then X, Y, Z to lock an axis, click or Enter to confirm, Esc or right-click to cancel |
+| Shift+X / Y / Z during G, R, S | Add or drop an axis. One axis: along it. Two (Shift+X then Shift+Y): move or scale in both and leave the third alone; rotate turns within that plane. None or all three: free |
+| K | Knife |
+| F | Make a face from the selected vertices (otherwise: face mode) |
+| Alt+Z | X-ray on / off |
 | E | Extrude selected faces along their normal |
 | I / Ctrl+B / Ctrl+R | Inset / bevel / loop cut |
 | Shift+D | Duplicate (object or faces) |
@@ -298,6 +353,9 @@ have a separate UV selection.
 | Drag the U or V arrow in the middle | Scale along that one axis only, about the middle of the selection |
 | G | Move with the mouse; X / Y lock an axis; click confirms, Esc cancels |
 | S | Scale about the centre; X / Y lock an axis |
+| R | Rotate about the middle of the selection with the mouse. Ctrl: 15° steps, Shift: 90° steps |
+| Drag the round knob above the selection frame | Rotate, same modifiers |
+| Rotate: Left 90° / Right 90° / 180° buttons | Exact quarter turns; with "Snap to pixels" on the result stays on the pixel grid |
 | L / Shift+L | Select the whole island under the mouse / add it. The Linked button grows the selection to whole islands |
 | Scroll, right- or middle-drag | Zoom, pan |
 

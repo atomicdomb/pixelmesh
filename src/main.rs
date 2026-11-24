@@ -2,6 +2,7 @@
 
 mod app;
 mod camera;
+mod open_files;
 mod paint;
 mod render;
 mod scene;
@@ -19,5 +20,7 @@ fn main() -> eframe::Result {
     };
     // Optional arguments: a .pmesh project, an .fbx to import and/or a texture image to open at startup.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // On macOS, be ready for files opened from Finder before anything else starts.
+    open_files::install();
     eframe::run_native("PixelMesh", options, Box::new(move |cc| Ok(Box::new(app::App::new(cc, &args)))))
 }

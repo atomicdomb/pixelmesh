@@ -285,6 +285,9 @@ pub struct App {
     pub bevel_segments: u32,
     /// Text to put on the system clipboard at the next opportunity (see `copy_uvs`).
     pub clipboard_marker: Option<&'static str>,
+    /// See-through faces in the 3D view; edges and vertices behind them show and can be picked.
+    pub xray: bool,
+    pub knife: Option<crate::viewport::Knife>,
 }
 
 impl App {
@@ -371,6 +374,8 @@ impl App {
             confirm_quit: false,
             bevel_segments: 1,
             clipboard_marker: None,
+            xray: false,
+            knife: None,
         };
         app.load_saved_palette();
         app.autosave.find_recovery();
@@ -379,20 +384,7 @@ impl App {
         let (export, export_groups) = (option("--export"), option("--export-groups"));
         let skip: Vec<&String> = [&export, &export_groups].into_iter().flatten().collect();
         for a in args.iter().filter(|a| !a.starts_with("--") && !skip.contains(a)) {
-            let p = Path::new(a);
-            match p.extension().and_then(|e| e.to_str()) {
-                Some("png" | "jpg" | "jpeg" | "bmp" | "tga") => app.load_texture(&cc.egui_ctx, p),
-                Some("fbx" | "FBX") => {
-                    // Opening an FBX directly: start from just that file.
-                    if app.undo.is_empty() {
-                        app.objects.clear();
-                        app.sel_objects.clear();
-                    }
-                    app.import_fbx(&cc.egui_ctx, p);
-                }
-                Some("pmesh") => app.open_project(&cc.egui_ctx, p),
-                _ => {}
-            }
+            app.open_path(&cc.egui_ctx, Path::new(a));
         }
         if export.is_some() || export_groups.is_some() {
             if let Some(path) = export {
@@ -408,11 +400,31 @@ impl App {
         app
     }
 
+    /// Open a file given on the command line or handed over by the system, by its type.
+    pub fn open_path(&mut self, ctx: &egui::Context, p: &Path) {
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+        match ext.as_str() {
+            "png" | "jpg" | "jpeg" | "bmp" | "tga" => self.load_texture(ctx, p),
+            "fbx" => {
+                // Opening an FBX into the untouched start-up scene: show just that file.
+                if self.undo.is_empty() && self.project_path.is_none() {
+                    self.objects.clear();
+                    self.sel_objects.clear();
+                }
+                self.import_fbx(ctx, p);
+            }
+            "pmesh" => self.open_project(ctx, p),
+            _ => self.status = format!("PixelMesh cannot open {}", p.display()),
+        }
+        // Come to the front when a file arrives while the window is in the background.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
     // --------------------------------------------------------------- objects
 
     /// True while a tool that follows the mouse is running; menus and panels are locked meanwhile.
     pub fn busy(&self) -> bool {
-        self.modal.is_some() || self.op.is_some() || self.loop_cut.is_some()
+        self.modal.is_some() || self.op.is_some() || self.loop_cut.is_some() || self.knife.is_some()
     }
 
     /// Mesh of the active object (an empty mesh when the scene has no objects).
@@ -1235,6 +1247,7 @@ impl App {
                 ui.separator();
                 ui.checkbox(&mut self.show_uv, "UV / Paint panel   U");
                 ui.checkbox(&mut self.show_gizmo, "Transform handles");
+                ui.checkbox(&mut self.xray, "X-ray   Alt+Z").on_hover_text("See through the mesh: faces turn transparent, and edges and vertices behind them show and can be selected");
                 if ui.button("Frame selected   .").clicked() {
                     self.frame_selected();
                 }
@@ -1422,6 +1435,28 @@ impl App {
         self.op = Some(crate::viewport::OpModal::new(crate::viewport::OpKind::Inset, self.mesh().clone(), faces, BTreeSet::new()));
     }
 
+    /// Inset or bevel picked from the side panel: the tool is selected, and the change itself
+    /// starts when the mouse is pressed and dragged in the 3D view. Picking it again puts it away.
+    pub fn arm_op(&mut self, kind: crate::viewport::OpKind) {
+        if self.op.as_ref().is_some_and(|op| op.waiting(kind)) {
+            self.revert_last();
+            return;
+        }
+        if self.op.as_ref().is_some_and(|op| op.armed) {
+            self.revert_last();
+        }
+        if self.busy() {
+            return;
+        }
+        match kind {
+            crate::viewport::OpKind::Inset => self.start_inset(),
+            crate::viewport::OpKind::Bevel => self.start_bevel(),
+        }
+        if let Some(op) = &mut self.op {
+            op.armed = true;
+        }
+    }
+
     pub fn start_bevel(&mut self) {
         let mesh = self.mesh();
         let edges: BTreeSet<(u32, u32)> = match self.sel_mode {
@@ -1596,6 +1631,12 @@ impl App {
         if ui.button("Loop cut   Ctrl+R").clicked() {
             self.start_loop_cut();
         }
+        if ui.button("Knife   K").clicked() {
+            self.start_knife();
+        }
+        if ui.add_enabled(self.sel_mode != SelMode::Face, egui::Button::new("Make face   F")).clicked() {
+            self.make_face();
+        }
         ui.separator();
         if ui.add_enabled(faces > 0, egui::Button::new("Duplicate   Shift+D")).clicked() && self.duplicate_selection() {
             self.start_modal_no_undo(ModalKind::Grab, None);
@@ -1682,6 +1723,10 @@ impl eframe::App for App {
                 }
             }
         }));
+        // Files handed over by the system: double-clicked, "Open With", dropped on the Dock icon.
+        for path in crate::open_files::take() {
+            self.open_path(&ctx, &path);
+        }
         self.poll_texture(&ctx);
         self.shortcuts(&ctx);
         if let Some(text) = self.clipboard_marker.take() {

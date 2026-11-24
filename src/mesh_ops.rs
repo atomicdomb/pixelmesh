@@ -259,6 +259,105 @@ impl Mesh {
         self.delete_faces(&ignore);
         Ok((self.faces.len() - count..self.faces.len()).collect())
     }
+    /// Put a new vertex on the edge between `a` and `b`, `t` of the way from `a` (0..1).
+    /// Every face that uses the edge receives it, with its UV interpolated. Returns the vertex.
+    pub fn split_edge(&mut self, a: u32, b: u32, t: f32) -> u32 {
+        let v = self.positions.len() as u32;
+        self.positions.push(self.positions[a as usize].lerp(self.positions[b as usize], t));
+        for face in &mut self.faces {
+            let n = face.verts.len();
+            for i in 0..n {
+                let (x, y) = (face.verts[i], face.verts[(i + 1) % n]);
+                if (x, y) != (a, b) && (x, y) != (b, a) {
+                    continue;
+                }
+                let from_x = if x == a { t } else { 1.0 - t };
+                let uv = face.uvs[i].lerp(face.uvs[(i + 1) % n], from_x);
+                face.verts.insert(i + 1, v);
+                face.uvs.insert(i + 1, uv);
+                break;
+            }
+        }
+        v
+    }
+
+    /// Cut a face in two with a new edge between two of its vertices. The face is the one
+    /// that has both (and does not already have an edge between them). Returns the new face;
+    /// the other half keeps the old face's index.
+    pub fn connect_verts(&mut self, a: u32, b: u32) -> Result<usize, &'static str> {
+        let mut joined = false;
+        for fi in 0..self.faces.len() {
+            let verts = &self.faces[fi].verts;
+            let n = verts.len();
+            let (Some(i), Some(j)) = (verts.iter().position(|&v| v == a), verts.iter().position(|&v| v == b)) else { continue };
+            let (i, j) = (i.min(j), i.max(j));
+            if j - i == 1 || j - i == n - 1 {
+                joined = true;
+                continue;
+            }
+            let face = self.faces[fi].clone();
+            let part = |range: Vec<usize>| Face { verts: range.iter().map(|&k| face.verts[k]).collect(), uvs: range.iter().map(|&k| face.uvs[k]).collect() };
+            self.faces[fi] = part((i..=j).collect());
+            self.faces.push(part((j..n).chain(0..=i).collect()));
+            return Ok(self.faces.len() - 1);
+        }
+        Err(if joined { "those two points already have an edge between them" } else { "those two points are not on the same face" })
+    }
+
+    /// Make a face from loose vertices. They are taken in the order of the edges that
+    /// already join them when those form one run; otherwise in order round their middle.
+    /// The face winds against its neighbours, or faces `toward` (the viewer) when it has none.
+    pub fn face_from_verts(&mut self, verts: &BTreeSet<u32>, toward: Vec3) -> Result<usize, &'static str> {
+        let n = verts.len();
+        if n < 3 {
+            return Err("select at least three vertices");
+        }
+        if self.faces.iter().any(|f| f.verts.len() == n && f.verts.iter().all(|v| verts.contains(v))) {
+            return Err("those vertices already make a face");
+        }
+        let between: BTreeSet<Edge> = self.edges().into_iter().filter(|(a, b)| verts.contains(a) && verts.contains(b)).map(|(a, b)| key(a, b)).collect();
+        let chain = edge_chains(&between).filter(|c| c.len() == 1 && c[0].0.len() == n).map(|mut c| c.remove(0).0);
+        let mut order: Vec<u32> = match chain {
+            Some(chain) => chain,
+            None => {
+                let pts: Vec<(u32, Vec3)> = verts.iter().map(|&v| (v, self.positions[v as usize])).collect();
+                let centre = pts.iter().map(|p| p.1).sum::<Vec3>() / n as f32;
+                // The plane the points lie in, from the widest pair of spokes.
+                let mut normal = Vec3::ZERO;
+                for (i, a) in pts.iter().enumerate() {
+                    for b in &pts[i + 1..] {
+                        let c = (a.1 - centre).cross(b.1 - centre);
+                        if c.length_squared() > normal.length_squared() {
+                            normal = c;
+                        }
+                    }
+                }
+                if normal.length_squared() < 1e-12 {
+                    return Err("those vertices lie on one line");
+                }
+                let (t, b) = face_basis(normal.normalize());
+                let angle = |p: Vec3| (p - centre).dot(b).atan2((p - centre).dot(t));
+                let mut sorted = pts.clone();
+                sorted.sort_by(|x, y| angle(x.1).total_cmp(&angle(y.1)));
+                sorted.into_iter().map(|p| p.0).collect()
+            }
+        };
+        let dir = self.directed_edge_faces();
+        let same = (0..n).filter(|&i| dir.contains_key(&(order[i], order[(i + 1) % n]))).count();
+        let opposite = (0..n).filter(|&i| dir.contains_key(&(order[(i + 1) % n], order[i]))).count();
+        let pts = |order: &[u32]| -> Vec<Vec3> { order.iter().map(|&v| self.positions[v as usize]).collect() };
+        let newell = |p: &[Vec3]| (0..n).fold(Vec3::ZERO, |acc, i| acc + p[i].cross(p[(i + 1) % n]));
+        let facing_away = newell(&pts(&order)).dot(toward) < 0.0;
+        if same > opposite || (same == opposite && facing_away) {
+            order.reverse();
+        }
+        let p = pts(&order);
+        let normal = newell(&p).normalize_or(Vec3::Y);
+        let (t, b) = face_basis(normal);
+        let flat: Vec<Vec2> = p.iter().map(|p| Vec2::new(p.dot(t), p.dot(b))).collect();
+        self.faces.push(Face { verts: order, uvs: normalize_points(&flat, true) });
+        Ok(self.faces.len() - 1)
+    }
 }
 
 #[cfg(test)]
@@ -395,5 +494,63 @@ mod tests {
         assert_eq!(c.len(), 2);
         assert!(c.iter().all(|c| !c.1));
         assert!(edge_chains(&[(0, 1), (0, 2), (0, 3)].into()).is_none());
+    }
+
+    #[test]
+    fn knife_cut_splits_a_face_and_keeps_the_mesh_closed() {
+        let mut m = Mesh::cube();
+        let before = volume(&m);
+        let v = m.faces[0].verts.clone();
+        // Midpoints of two opposite edges of face 0, then join them.
+        let a = m.split_edge(v[0], v[1], 0.5);
+        let b = m.split_edge(v[2], v[3], 0.25);
+        assert!(is_closed(&m));
+        assert_eq!(m.faces[0].verts.len(), 6);
+        let new = m.connect_verts(a, b).unwrap();
+        assert_eq!(m.faces.len(), 7);
+        assert_eq!(m.faces[0].verts.len() + m.faces[new].verts.len(), 8);
+        assert!(is_closed(&m));
+        assert!((volume(&m) - before).abs() < 1e-4);
+        // UVs of the new vertex are interpolated in every face.
+        let k = m.faces[0].verts.iter().position(|&x| x == a).unwrap();
+        assert!(m.faces[0].uvs[k].x >= 0.0 && m.faces[0].uvs[k].x <= 1.0);
+        assert!(m.connect_verts(a, b).is_err());
+        assert!(m.connect_verts(a, v[0]).is_err());
+        // Corner to corner works too.
+        let mut m = Mesh::cube();
+        let v = m.faces[1].verts.clone();
+        m.connect_verts(v[0], v[2]).unwrap();
+        assert_eq!(m.faces.len(), 7);
+        assert!(is_closed(&m));
+    }
+
+    #[test]
+    fn face_from_vertices() {
+        // Refill a hole from its four corner vertices: faces outwards again.
+        let mut m = Mesh::cube();
+        let before = volume(&m);
+        let hole: BTreeSet<u32> = m.faces[3].verts.iter().copied().collect();
+        m.delete_faces(&[3].into());
+        let f = m.face_from_verts(&hole, Vec3::ZERO).unwrap();
+        assert_eq!(m.faces[f].verts.len(), 4);
+        assert!(is_closed(&m));
+        assert!((volume(&m) - before).abs() < 1e-4);
+        assert!(m.face_from_verts(&hole, Vec3::ZERO).is_err());
+        // Loose points with no edges: ordered round their middle, facing the viewer.
+        let mut m = Mesh::default();
+        m.positions = vec![Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0)];
+        let f = m.face_from_verts(&(0..4).collect(), Vec3::Z).unwrap();
+        assert!(m.face_normal(f).z > 0.9);
+        // A proper square, not a bow tie: its area is 1.
+        let area: f32 = m.triangulate(f).iter().map(|t| {
+            let [a, b, c] = t.map(|k| m.positions[m.faces[f].verts[k] as usize]);
+            (b - a).cross(c - a).length() * 0.5
+        }).sum();
+        assert!((area - 1.0).abs() < 1e-4, "{area}");
+        let mut m2 = Mesh::default();
+        m2.positions = m.positions.clone();
+        let f = m2.face_from_verts(&(0..4).collect(), -Vec3::Z).unwrap();
+        assert!(m2.face_normal(f).z < -0.9);
+        assert!(m2.face_from_verts(&[0, 1].into(), Vec3::Z).is_err());
     }
 }

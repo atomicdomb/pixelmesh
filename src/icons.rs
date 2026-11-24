@@ -31,9 +31,11 @@ pub enum Icon {
     Subdivide,
     Bridge,
     FillHole,
+    Knife,
+    MakeFace,
 }
 
-pub const ALL: [Icon; 51] = [
+pub const ALL: [Icon; 53] = [
     Icon::Object, Icon::Vertex, Icon::Edge, Icon::Face,
     Icon::Click, Icon::BoxSelect, Icon::CircleSelect,
     Icon::Plane, Icon::Cube, Icon::Cylinder, Icon::Cone, Icon::Sphere,
@@ -44,7 +46,7 @@ pub const ALL: [Icon; 51] = [
     Icon::EyeOpen, Icon::EyeClosed,
     Icon::Pencil, Icon::Eraser, Icon::Fill, Icon::Picker, Icon::Line, Icon::Rect,
     Icon::Wand, Icon::Mirror, Icon::Apply, Icon::Unwrap,
-    Icon::Subdivide, Icon::Bridge, Icon::FillHole,
+    Icon::Subdivide, Icon::Bridge, Icon::FillHole, Icon::Knife, Icon::MakeFace,
 ];
 
 /// A 16x16 scratch canvas with a few drawing helpers.
@@ -458,6 +460,21 @@ pub fn pixels(icon: Icon) -> Vec<u8> {
             c.f(4, 4, 11, 11, O);
             c.dash(4, 4, 11, 4, W);
             c.dash(4, 11, 11, 11, W);
+        }
+        Icon::Knife => {
+            // A face with a cut running across it.
+            c.r(2, 3, 13, 12, G);
+            c.l(4, 12, 11, 3, O);
+            c.l(5, 12, 12, 3, O);
+            c.f(11, 1, 13, 3, W);
+        }
+        Icon::MakeFace => {
+            // Four vertices with a face filled in between them.
+            c.f(4, 4, 11, 11, O);
+            c.f(2, 2, 4, 4, W);
+            c.f(11, 2, 13, 4, W);
+            c.f(2, 11, 4, 13, W);
+            c.f(11, 11, 13, 13, W);
         }
         Icon::Unwrap => {
             // A sheet with islands laid out on it.

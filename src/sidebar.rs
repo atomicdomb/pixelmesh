@@ -550,12 +550,12 @@ impl App {
     fn mesh_card(&mut self, ui: &mut egui::Ui) {
         let w = tile_width(ui, 5);
         #[derive(Clone, Copy)]
-        enum Act { Extrude, Inset, Bevel, LoopCut, Duplicate, Delete, Flip, MergeFaces, Weld, Subdivide, Bridge, Fill }
+        enum Act { Extrude, Inset, Bevel, LoopCut, Duplicate, Delete, Flip, MergeFaces, Weld, Subdivide, Bridge, Fill, Knife, MakeFace }
         let mut act = None;
         let items = [
             (Act::Extrude, Icon::Extrude, "Extrude", "Pull the selected faces out  (E)"),
-            (Act::Inset, Icon::Inset, "Inset", "Shrink the selected faces inwards, leaving a rim  (I)"),
-            (Act::Bevel, Icon::Bevel, "Bevel", "Chamfer or round the selected edges  (Ctrl+B)\nWhile sizing it, press 1-9 for the number of segments: 1 is a flat chamfer, more make it round."),
+            (Act::Inset, Icon::Inset, "Inset", "Shrink the selected faces inwards, leaving a rim  (I)\nPick the tool here, then press and drag in the 3D view; release to confirm."),
+            (Act::Bevel, Icon::Bevel, "Bevel", "Chamfer or round the selected edges  (Ctrl+B)\nPick the tool here, then press and drag in the 3D view; release to confirm.\nWhile sizing it, press 1-9 for the number of segments: 1 is a flat chamfer, more make it round."),
             (Act::LoopCut, Icon::LoopCut, "Loop cut", "Cut a ring of faces in two  (Ctrl+R)"),
             (Act::MergeFaces, Icon::MergeFaces, "Join", "Merge adjoining selected faces into one  (M)"),
             (Act::Duplicate, Icon::Duplicate, "Copy", "Duplicate the selection and move it  (Shift+D)"),
@@ -565,11 +565,19 @@ impl App {
             (Act::Subdivide, Icon::Subdivide, "Subdivide", "Split the selected faces evenly: a quad becomes four"),
             (Act::Bridge, Icon::Bridge, "Bridge", "Join two edge loops with a band of faces.\nIn face mode: select two faces; they are removed and their outlines joined (a tunnel, or a connecting piece)."),
             (Act::Fill, Icon::FillHole, "Fill", "Close a hole: select the edges (or vertices) around it and a face is made"),
+            (Act::Knife, Icon::Knife, "Knife", "Cut new edges into faces  (K)\nClick a point on an edge or a vertex, then the next: each click cuts the face between the two. Ctrl snaps to the middle of an edge. Enter or right-click finishes, Esc undoes the cuts."),
+            (Act::MakeFace, Icon::MakeFace, "Face", "Make a face from the selected vertices (three or more)  (F)\nIt faces you, or matches the faces next to it."),
         ];
         for chunk in items.chunks(5) {
             row(ui, |ui| {
                 for &(a, icon, label, tip) in chunk {
-                    if self.tile(ui, icon, label, false, w).on_hover_text(tip).clicked() {
+                    // Inset and bevel stay lit while they wait for the drag in the 3D view.
+                    let waiting = match a {
+                        Act::Inset => self.op.as_ref().is_some_and(|op| op.waiting(crate::viewport::OpKind::Inset)),
+                        Act::Bevel => self.op.as_ref().is_some_and(|op| op.waiting(crate::viewport::OpKind::Bevel)),
+                        _ => false,
+                    };
+                    if self.tile(ui, icon, label, waiting, w).on_hover_text(tip).clicked() {
                         act = Some(a);
                     }
                 }
@@ -577,8 +585,8 @@ impl App {
         }
         match act {
             Some(Act::Extrude) => self.extrude(),
-            Some(Act::Inset) => self.start_inset(),
-            Some(Act::Bevel) => self.start_bevel(),
+            Some(Act::Inset) => self.arm_op(crate::viewport::OpKind::Inset),
+            Some(Act::Bevel) => self.arm_op(crate::viewport::OpKind::Bevel),
             Some(Act::LoopCut) => self.start_loop_cut(),
             Some(Act::Duplicate) => {
                 if self.duplicate_selection() {
@@ -597,6 +605,8 @@ impl App {
             Some(Act::Subdivide) => self.subdivide_selection(),
             Some(Act::Bridge) => self.bridge_selection(),
             Some(Act::Fill) => self.fill_selection(),
+            Some(Act::Knife) => self.start_knife(),
+            Some(Act::MakeFace) => self.make_face(),
             Some(Act::Weld) => {
                 self.push_undo();
                 let n = self.mesh_mut().merge_by_distance(1e-4);

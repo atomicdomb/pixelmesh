@@ -50,6 +50,10 @@ pub struct FrameData {
     pub points: Batch,
     /// (version, width, height, rgba) - re-uploaded when the version changes.
     pub texture: Option<(u64, u32, u32, std::sync::Arc<Vec<u8>>)>,
+    /// See-through faces, with every edge and vertex showing.
+    pub xray: bool,
+    /// Draw the grid behind everything instead of letting it cut through the geometry.
+    pub grid_behind: bool,
 }
 
 pub struct Renderer {
@@ -94,6 +98,7 @@ in vec2 v_uv;
 in vec4 v_color;
 uniform sampler2D u_tex;
 uniform int u_mode; // 0 = lit + textured, 1 = flat colour
+uniform float u_alpha; // below 1: x-ray
 out vec4 o_color;
 void main() {
     if (u_mode == 1) {
@@ -105,9 +110,9 @@ void main() {
     if (t.a < 0.5) discard;
     float d = dot(normalize(v_normal), normalize(vec3(0.35, 0.85, 0.5)));
     // Back faces are drawn dark so flipped normals are easy to spot.
-    float light = gl_FrontFacing ? 0.72 + 0.28 * d : 0.3;
+    float light = gl_FrontFacing ? 0.72 + 0.28 * d : (u_alpha < 1.0 ? 0.6 : 0.3);
     vec3 rgb = mix(t.rgb * light, v_color.rgb, v_color.a);
-    o_color = vec4(rgb, 1.0);
+    o_color = vec4(rgb, u_alpha);
 }
 "#;
 
@@ -242,8 +247,28 @@ impl Renderer {
                 }
             };
 
+            let grid_first = frame.grid_behind || frame.xray;
+            if grid_first {
+                // The grid as a backdrop: nothing it touches is hidden by it.
+                gl.disable(glow::DEPTH_TEST);
+                gl.uniform_1_i32(mode.as_ref(), 1);
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+                draw(&frame.grid, glow::LINES);
+                gl.disable(glow::BLEND);
+                gl.enable(glow::DEPTH_TEST);
+            }
+
             // Faces, pushed back slightly so edges and vertices on top of them win the depth test.
             gl.uniform_1_i32(mode.as_ref(), 0);
+            let alpha = gl.get_uniform_location(self.program, "u_alpha");
+            gl.uniform_1_f32(alpha.as_ref(), if frame.xray { 0.38 } else { 1.0 });
+            if frame.xray {
+                // See-through: blended, and not hiding anything behind.
+                gl.enable(glow::BLEND);
+                gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+                gl.depth_mask(false);
+            }
             gl.enable(glow::POLYGON_OFFSET_FILL);
             gl.polygon_offset(1.0, 1.0);
             for layer in &self.layers {
@@ -251,11 +276,18 @@ impl Renderer {
             }
             draw(&frame.tris, glow::TRIANGLES);
             gl.disable(glow::POLYGON_OFFSET_FILL);
+            if frame.xray {
+                gl.depth_mask(true);
+                // Edges and vertices show through everything.
+                gl.disable(glow::DEPTH_TEST);
+            }
 
             gl.uniform_1_i32(mode.as_ref(), 1);
             gl.enable(glow::BLEND);
             gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
-            draw(&frame.grid, glow::LINES);
+            if !grid_first {
+                draw(&frame.grid, glow::LINES);
+            }
             for layer in &self.layers {
                 draw_cached(&layer.lines, glow::LINES);
             }

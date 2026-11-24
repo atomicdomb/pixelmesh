@@ -37,6 +37,24 @@ pub struct Modal {
     drag: bool,
     /// The gizmo handle this drag started from.
     grabbed: Option<Handle>,
+    /// Axes switched on with Shift+X / Y / Z (indices into `mask_axes`); two of them make a plane.
+    mask: [bool; 3],
+    mask_axes: [Vec3; 3],
+}
+
+impl Modal {
+    /// The two directions of the plane picked with Shift+axis keys, if exactly two are on.
+    fn plane(&self) -> Option<[Vec3; 2]> {
+        let on: Vec<Vec3> = (0..3).filter(|&i| self.mask[i]).map(|i| self.mask_axes[i]).collect();
+        (on.len() == 2).then(|| [on[0], on[1]])
+    }
+}
+
+/// Knife tool state: the vertex the next cut starts from, and how many cuts were made.
+#[derive(Default)]
+pub struct Knife {
+    last: Option<u32>,
+    cuts: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -56,11 +74,20 @@ pub struct OpModal {
     value: f32,
     /// Bevel: bands across the strip (1 = a flat chamfer, more = rounded).
     pub segments: u32,
+    /// Chosen from the side panel: nothing happens until the mouse is pressed in the 3D view.
+    pub armed: bool,
+    /// Started by that press: sized while the button is held, confirmed on release.
+    drag: bool,
 }
 
 impl OpModal {
+    /// True while this tool is selected and waiting to be dragged in the 3D view.
+    pub fn waiting(&self, kind: OpKind) -> bool {
+        self.armed && self.kind == kind
+    }
+
     pub fn new(kind: OpKind, base: Mesh, faces: BTreeSet<usize>, edges: BTreeSet<(u32, u32)>) -> Self {
-        OpModal { kind, base, faces, edges, start_mouse: None, value: 0.0, segments: 1 }
+        OpModal { kind, base, faces, edges, start_mouse: None, value: 0.0, segments: 1, armed: false, drag: false }
     }
 }
 
@@ -169,6 +196,8 @@ enum Xf {
     Rotate(Quat),
     /// Scale factor, optionally only along one direction.
     Scale(f32, Option<Vec3>),
+    /// Scale along two directions at once, leaving the third alone.
+    Scale2(f32, Vec3, Vec3),
 }
 
 impl Xf {
@@ -180,6 +209,10 @@ impl Xf {
             Xf::Scale(s, Some(a)) => {
                 let d = p - pivot;
                 pivot + d + a * d.dot(a) * (s - 1.0)
+            }
+            Xf::Scale2(s, a, b) => {
+                let d = p - pivot;
+                pivot + d + (a * d.dot(a) + b * d.dot(b)) * (s - 1.0)
             }
         }
     }
@@ -247,6 +280,8 @@ impl App {
             readout: String::new(),
             drag: false,
             grabbed: None,
+            mask: [false; 3],
+            mask_axes: [Vec3::X, Vec3::Y, Vec3::Z],
         });
     }
 
@@ -340,7 +375,28 @@ impl App {
         let toward_viewer = cam.back();
         let step = self.grid_snap;
 
+        let plane = m.plane();
         Some(match m.kind {
+            ModalKind::Grab if plane.is_some() => {
+                // Two axes: slide in the plane they span.
+                let [a, b] = plane.unwrap();
+                let normal = a.cross(b).normalize_or(toward_viewer);
+                let mut d = if normal.dot(toward_viewer).abs() > 0.08 {
+                    plane_hit(m.pivot, normal, cam.ray(rect, mouse)) - plane_hit(m.pivot, normal, cam.ray(rect, start))
+                } else {
+                    // The plane is seen edge-on: take what can be seen of the mouse's movement.
+                    let hit = |p: Pos2| plane_hit(m.pivot, toward_viewer, cam.ray(rect, p));
+                    let free = hit(mouse) - hit(start);
+                    free - normal * free.dot(normal)
+                };
+                let (mut da, mut db) = (d.dot(a), d.dot(b));
+                if snap {
+                    (da, db) = ((da / step).round() * step, (db / step).round() * step);
+                }
+                d = a * da + b * db;
+                m.readout = format!("{da:.3}, {db:.3}");
+                Xf::Translate(d)
+            }
             ModalKind::Grab => Xf::Translate(match m.axis {
                 Some(a) => {
                     let t = line_param(m.pivot, a, cam.ray(rect, mouse)) - line_param(m.pivot, a, cam.ray(rect, start));
@@ -360,8 +416,10 @@ impl App {
             }),
             ModalKind::Rotate => {
                 let centre = cam.project(rect, m.pivot)?;
-                let axis = m.axis.unwrap_or(toward_viewer);
-                let mut angle = match m.axis {
+                // With two axes picked, turn within their plane: about the third.
+                let fixed = plane.map(|[a, b]| a.cross(b).normalize_or(toward_viewer)).or(m.axis);
+                let axis = fixed.unwrap_or(toward_viewer);
+                let mut angle = match fixed {
                     // About a fixed axis seen reasonably face-on: follow the cursor round that axis
                     // in the ring's own plane, so the geometry stays under the mouse.
                     Some(a) if a.dot(toward_viewer).abs() > 0.25 => {
@@ -404,7 +462,10 @@ impl App {
                     s = (s * 10.0).round() / 10.0;
                 }
                 m.readout = format!("×{s:.3}");
-                Xf::Scale(s, m.axis)
+                match plane {
+                    Some([a, b]) => Xf::Scale2(s, a, b),
+                    None => Xf::Scale(s, m.axis),
+                }
             }
         })
     }
@@ -422,6 +483,21 @@ impl App {
             if let Some(n) = digits.iter().position(|&k| key(k)) {
                 op.segments = n as u32 + 1;
                 self.bevel_segments = op.segments;
+            }
+        }
+        let (pressed, down) = ui.input(|i| (i.pointer.button_pressed(PointerButton::Primary), i.pointer.button_down(PointerButton::Primary)));
+        if op.armed {
+            // The tool was picked in the side panel: it starts with a press in the 3D view.
+            match mouse.filter(|_| pressed && resp.hovered()) {
+                Some(at) => {
+                    op.armed = false;
+                    op.drag = true;
+                    op.start_mouse = Some(at);
+                }
+                None => {
+                    self.op = Some(op);
+                    return;
+                }
             }
         }
         if let Some(mouse) = mouse {
@@ -447,7 +523,8 @@ impl App {
             *self.mesh_mut() = mesh;
             self.select_faces(fallback);
         }
-        if key(Key::Enter) || resp.clicked_by(PointerButton::Primary) {
+        let confirmed = if op.drag { !down } else { resp.clicked_by(PointerButton::Primary) };
+        if key(Key::Enter) || confirmed {
             if op.value <= 0.0 {
                 // Nothing was changed: drop the undo step again.
                 self.revert_last();
@@ -455,6 +532,76 @@ impl App {
             return;
         }
         self.op = Some(op);
+    }
+
+    /// Where the knife would cut for a cursor position: a point on the nearest edge, snapped to
+    /// the edge's ends when close to them. Returns (edge, fraction along it, point, vertex if snapped).
+    fn knife_target(&self, rect: egui::Rect, pos: Pos2, midpoint: bool) -> Option<((u32, u32), f32, Vec3, Option<u32>)> {
+        let (a, b) = self.edge_near(rect, pos, 16.0)?;
+        let mesh = self.mesh();
+        let (pa, pb) = (mesh.positions[a as usize], mesh.positions[b as usize]);
+        let near = |p: Vec3| self.camera.project(rect, p).is_some_and(|sp| sp.distance(pos) <= 9.0);
+        if midpoint {
+            return Some(((a, b), 0.5, pa.lerp(pb, 0.5), None));
+        }
+        if near(pa) {
+            return Some(((a, b), 0.0, pa, Some(a)));
+        }
+        if near(pb) {
+            return Some(((a, b), 1.0, pb, Some(b)));
+        }
+        let t = line_param(pa, pb - pa, self.camera.ray(rect, pos)).clamp(0.02, 0.98);
+        Some(((a, b), t, pa.lerp(pb, t), None))
+    }
+
+    /// Knife: each click puts a point on an edge and cuts the face between it and the last point.
+    fn knife_step(&mut self, ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect, mouse: Option<Pos2>, keys: bool) -> Preview {
+        let Some(mut knife) = self.knife.take() else { return Preview::default() };
+        let key = |k: Key| keys && ui.input(|i| i.key_pressed(k));
+        if key(Key::Escape) {
+            // Throw the cuts away.
+            self.revert_last();
+            self.status = "Knife cancelled.".into();
+            return Preview::default();
+        }
+        if key(Key::Enter) || resp.clicked_by(PointerButton::Secondary) {
+            if knife.cuts == 0 {
+                self.revert_last();
+            } else {
+                self.status = format!("Knife: {} cut(s).", knife.cuts);
+            }
+            return Preview::default();
+        }
+        let midpoint = ui.input(|i| i.modifiers.command);
+        let target = mouse.filter(|m| rect.contains(*m)).and_then(|m| self.knife_target(rect, m, midpoint));
+        let mut preview = Preview::default();
+        if let Some(last) = knife.last.and_then(|v| self.mesh().positions.get(v as usize).copied()) {
+            preview.points.push(last);
+            // A line to where the cut would end, or just to the cursor while it is not on an edge.
+            let end = target.map(|t| t.2).or_else(|| mouse.map(|m| plane_hit(last, self.camera.back(), self.camera.ray(rect, m))));
+            if let Some(end) = end {
+                preview.lines.push([last, end]);
+            }
+        }
+        if let Some((_, _, point, _)) = target {
+            preview.points.push(point);
+        }
+        if let (true, Some(((a, b), t, _, snapped))) = (resp.clicked_by(PointerButton::Primary), target) {
+            let v = snapped.unwrap_or_else(|| self.mesh_mut().split_edge(a, b, t));
+            match knife.last {
+                Some(last) if last != v => match self.mesh_mut().connect_verts(last, v) {
+                    Ok(_) => {
+                        knife.cuts += 1;
+                        self.status = format!("Knife: {} cut(s). Keep clicking, or Enter / right-click to finish.", knife.cuts);
+                    }
+                    Err(e) => self.status = format!("Knife: {e}. Carrying on from the new point."),
+                },
+                _ => {}
+            }
+            knife.last = Some(v);
+        }
+        self.knife = Some(knife);
+        preview
     }
 
     /// The edge a loop cut should start from: the nearest edge of the face under the cursor,
@@ -569,17 +716,43 @@ impl App {
         let Some(m) = &mut self.modal else { return };
         let pressed = |k: Key| ui.input(|i| i.key_pressed(k));
         if !m.drag {
+            let shift = ui.input(|i| i.modifiers.shift);
             for (i, (_, name, _)) in AXES.into_iter().enumerate() {
                 let axis = axes[i];
                 let key = [Key::X, Key::Y, Key::Z][i];
-                if pressed(key) {
+                if !pressed(key) {
+                    continue;
+                }
+                if shift {
+                    // Shift adds or removes this axis: one = along it, two = in their plane, none or all = free.
+                    if m.mask == [false; 3] {
+                        if let Some(k) = (0..3).find(|&k| m.axis == Some(axes[k])) {
+                            m.mask[k] = true;
+                        }
+                    }
+                    m.mask_axes = axes;
+                    m.mask[i] = !m.mask[i];
+                    let on: Vec<usize> = (0..3).filter(|&k| m.mask[k]).collect();
+                    if on.len() == 3 {
+                        m.mask = [false; 3];
+                    }
+                    (m.axis, m.axis_name) = match on[..] {
+                        [k] => (Some(axes[k]), AXES[k].1),
+                        [0, 1] => (None, "X and Y"),
+                        [0, 2] => (None, "X and Z"),
+                        [1, 2] => (None, "Y and Z"),
+                        _ => (None, ""),
+                    };
+                } else {
                     // Pressing the same axis again frees the constraint.
+                    m.mask = [false; 3];
                     if m.axis == Some(axis) {
                         m.axis = None;
                         m.axis_name = "";
                     } else {
                         m.axis = Some(axis);
                         m.axis_name = name;
+                        m.mask[i] = true;
                     }
                 }
             }
@@ -670,7 +843,16 @@ impl App {
         } else if pressed(Key::M) {
             self.merge_selected_faces();
         } else if pressed(Key::F) {
-            self.set_mode(SelMode::Face);
+            // With vertices selected that could be a face, F makes it; otherwise it is face mode.
+            if self.can_make_face() {
+                self.make_face();
+            } else {
+                self.set_mode(SelMode::Face);
+            }
+        } else if pressed(Key::K) {
+            self.start_knife();
+        } else if pressed(Key::Z) && alt {
+            self.xray = !self.xray;
         } else if pressed(Key::Q) {
             self.select_tool = SelectTool::Click;
         } else if pressed(Key::B) {
@@ -752,6 +934,9 @@ impl App {
     /// Is the point `p` (projected at `sp`) of the active mesh not hidden behind one of its faces?
     /// `own_face` is ignored as an occluder (used for face centres).
     fn point_visible(&self, rect: egui::Rect, p: Vec3, sp: Pos2, own_face: Option<usize>) -> bool {
+        if self.xray {
+            return true;
+        }
         let (o, dir) = self.camera.ray(rect, sp);
         let dist = (p - o).dot(dir);
         match self.mesh().raycast(o, dir) {
@@ -931,15 +1116,36 @@ impl App {
         let mut lines = Batch::default();
         let mut points = Batch::default();
 
-        let n = 8;
+        // The grid lies on the ground, except in the straight-on front and side views, where
+        // the ground would only be a line: there it stands upright, facing the camera.
+        const RED: [f32; 4] = [0.9, 0.3, 0.3, 0.7];
+        const GREEN: [f32; 4] = [0.45, 0.8, 0.3, 0.7];
+        const BLUE: [f32; 4] = [0.3, 0.5, 0.95, 0.7];
+        let upright = match self.view_name().filter(|_| self.camera.ortho) {
+            Some("Front" | "Back") => Some((Vec3::X, Vec3::Y, RED, GREEN)),
+            Some("Right" | "Left") => Some((Vec3::Z, Vec3::Y, BLUE, GREEN)),
+            _ => None,
+        };
+        let grid_behind = upright.is_some() || (self.camera.ortho && self.view_name().is_some());
+        let (u, v, u_colour, v_colour) = upright.unwrap_or((Vec3::X, Vec3::Z, RED, BLUE));
+        // In the upright views the grid follows what is in view, so it never runs out.
+        let n = if upright.is_some() { ((self.camera.distance * 1.5).ceil() as i32).clamp(8, 60) } else { 8 };
+        let centre = if upright.is_some() {
+            u * self.camera.target.dot(u).round() + v * self.camera.target.dot(v).round()
+        } else {
+            Vec3::ZERO
+        };
+        let e = n as f32;
         for i in -n..=n {
-            let (f, e) = (i as f32, n as f32);
-            let c = [1.0, 1.0, 1.0, if i == 0 { 0.0 } else { 0.09 }];
-            grid.line(Vec3::new(f, 0.0, -e), Vec3::new(f, 0.0, e), c);
-            grid.line(Vec3::new(-e, 0.0, f), Vec3::new(e, 0.0, f), c);
+            let f = i as f32;
+            let c = [1.0, 1.0, 1.0, 0.09];
+            grid.line(centre + u * f - v * e, centre + u * f + v * e, c);
+            grid.line(centre - u * e + v * f, centre + u * e + v * f, c);
         }
-        grid.line(Vec3::new(-8.0, 0.0, 0.0), Vec3::new(8.0, 0.0, 0.0), [0.9, 0.3, 0.3, 0.7]);
-        grid.line(Vec3::new(0.0, 0.0, -8.0), Vec3::new(0.0, 0.0, 8.0), [0.3, 0.5, 0.95, 0.7]);
+        // The axes themselves, through the world origin.
+        let (cu, cv) = (centre.dot(u), centre.dot(v));
+        grid.line(u * (cu - e), u * (cu + e), u_colour);
+        grid.line(v * (cv - e), v * (cv + e), v_colour);
 
         let object_mode = self.sel_mode == SelMode::Object;
         let density = self.show_density.then(|| (self.px_per_unit, self.tex_size()));
@@ -1053,6 +1259,9 @@ impl App {
             if let Some(a) = m.axis {
                 lines.line(m.pivot - a * 50.0, m.pivot + a * 50.0, [1.0, 1.0, 1.0, 0.5]);
             }
+            for a in m.plane().into_iter().flatten() {
+                lines.line(m.pivot - a * 50.0, m.pivot + a * 50.0, [1.0, 1.0, 1.0, 0.5]);
+            }
         }
 
         FrameData {
@@ -1063,6 +1272,8 @@ impl App {
             lines,
             points,
             texture: self.texture.as_ref().map(|t| (t.version, t.size[0], t.size[1], t.rgba.clone())),
+            xray: self.xray,
+            grid_behind,
         }
     }
 
@@ -1135,6 +1346,9 @@ impl App {
             ui.ctx().request_repaint();
         } else if self.loop_cut.is_some() {
             preview = self.loop_cut_step(ui, &resp, rect, mouse, snap, keyboard_free);
+            ui.ctx().request_repaint();
+        } else if self.knife.is_some() {
+            preview = self.knife_step(ui, &resp, rect, mouse, keyboard_free);
             ui.ctx().request_repaint();
         } else if painting {
             if resp.hovered() && keyboard_free {
@@ -1244,7 +1458,7 @@ impl App {
 
         // ---- draw gizmo on top (recomputed so it follows the selection while dragging)
         let dragging = self.modal.as_ref().filter(|m| m.drag).map(|m| m.grabbed.unwrap_or(Handle::Centre));
-        let show = self.show_gizmo && !painting && self.modal.as_ref().is_none_or(|m| m.drag) && self.op.is_none() && self.loop_cut.is_none();
+        let show = self.show_gizmo && !painting && self.modal.as_ref().is_none_or(|m| m.drag) && self.op.is_none() && self.loop_cut.is_none() && self.knife.is_none();
         if let Some(mut g) = show.then(|| self.gizmo(rect)).flatten() {
             // While dragging, keep showing the handle type that was grabbed.
             if let Some(m) = self.modal.as_ref().filter(|m| m.drag) {
@@ -1350,13 +1564,21 @@ impl App {
             } else {
                 format!("Bevel ({} segment{}, [1-9] to change)", op.segments, if op.segments == 1 { "" } else { "s" })
             };
-            Some(format!("{what}:  {:.3}{snap_note}    move the mouse right for more   [Ctrl] flip snap   [Click/Enter] confirm   [Esc/Right-click] cancel", op.value))
+            if op.armed {
+                Some(format!("{what}: press in the 3D view and drag to the right, release to confirm   [Esc/Right-click] cancel"))
+            } else if op.drag {
+                Some(format!("{what}:  {:.3}{snap_note}    drag right for more   [Ctrl] flip snap   release to confirm   [Esc] cancel", op.value))
+            } else {
+                Some(format!("{what}:  {:.3}{snap_note}    move the mouse right for more   [Ctrl] flip snap   [Click/Enter] confirm   [Esc/Right-click] cancel", op.value))
+            }
         } else if let Some(lc) = &self.loop_cut {
             Some(if lc.slide.is_some() {
                 format!("Loop cut: slide {:.0}%{snap_note}    [Click/Enter] confirm   [Ctrl] flip snap   [Esc/Right-click] cancel", lc.t * 100.0)
             } else {
                 format!("Loop cut: hover an edge and click   cuts: {}   [1-9] number of cuts   [Esc/Right-click] cancel", lc.cuts)
             })
+        } else if self.knife.is_some() {
+            Some("Knife: click edge to edge to cut   [Ctrl] middle of edge   [Enter/Right-click] finish   [Esc] cancel".to_string())
         } else {
             None
         };
@@ -1373,7 +1595,7 @@ impl App {
                 if m.drag {
                     format!("{what}{axis}:  {}{snap_note}    [Ctrl] flip snap   [Esc/Right-click] cancel", m.readout)
                 } else {
-                    format!("{what}{axis}:  {}{snap_note}    [X/Y/Z] axis   [Ctrl] flip snap   [Click/Enter] confirm   [Esc/Right-click] cancel", m.readout)
+                    format!("{what}{axis}:  {}{snap_note}    [X/Y/Z] axis   [Shift+X/Y/Z] add or drop an axis   [Ctrl] flip snap   [Click/Enter] confirm   [Esc] cancel", m.readout)
                 }
             }
             None => match self.sel_mode {
@@ -1436,12 +1658,15 @@ impl App {
 
         // ---- view buttons, top right
         let current = self.view_name();
-        let bar = egui::Rect::from_min_max(egui::pos2(rect.right() - 372.0, rect.top() + 6.0), egui::pos2(rect.right() - 6.0, rect.top() + 28.0));
+        let bar = egui::Rect::from_min_max(egui::pos2(rect.right() - 430.0, rect.top() + 6.0), egui::pos2(rect.right() - 6.0, rect.top() + 28.0));
         let mut chosen = None;
         let mut toggle_ortho = false;
         ui.scope_builder(egui::UiBuilder::new().max_rect(bar).layout(egui::Layout::right_to_left(egui::Align::Center)), |ui| {
             ui.spacing_mut().item_spacing.x = 3.0;
             ui.add_enabled_ui(!was_busy, |ui| {
+                if ui.selectable_label(self.xray, "X-ray").on_hover_text("See through the mesh  ·  Alt+Z").clicked() {
+                    self.xray = !self.xray;
+                }
                 toggle_ortho = ui.selectable_label(self.camera.ortho, "Ortho").on_hover_text("Orthographic (no perspective)  ·  5").clicked();
                 ui.add_space(6.0);
                 for (view, tip) in crate::app::VIEWS.iter().zip(["1", "Ctrl+1", "3", "Ctrl+3", "7", "Ctrl+7"]).rev() {
